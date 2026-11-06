@@ -2,7 +2,13 @@ import { Hono } from "hono";
 import { afterEach, describe, expect, it } from "vitest";
 import { createJuniorApi, type JuniorApiVariables } from "@/api";
 import { createAcpConversations } from "@/api/acp/conversations";
-import { getAgentInvocation } from "@/chat/agent-invocations/store";
+import { enqueueAgentInvocationResult } from "@/chat/agent-invocations/result";
+import {
+  completeAgentInvocation,
+  createAgentInvocation,
+  getAgentInvocation,
+} from "@/chat/agent-invocations/store";
+import type { TerminalAgentInvocation } from "@/chat/agent-invocations/types";
 import { stopConversationTurnResponseSchema } from "@/api/schema";
 import {
   appendAndEnqueueWebMessage,
@@ -11,10 +17,11 @@ import {
 } from "@/chat/conversations/web-input";
 import { legacyWebActorUserId } from "@/chat/conversations/legacy-web-actor-id";
 import { getConversationEventStore } from "@/chat/db";
+import { isEventMailboxMetadata } from "@/chat/events/notification";
 import {
   ackMessages,
   completeConversationWork,
-  hasConversationStop,
+  getConversationWorkState,
   startConversationWork,
 } from "@/chat/task-execution/store";
 import {
@@ -23,9 +30,15 @@ import {
   type ConversationFixture,
 } from "../../../fixtures/conversation";
 import {
+  abortableAgentRunner,
   expectChildAgentStopped,
+  invocationInput,
+  loadTurnEvents,
+  spawnChildAgent,
   startRunningChildAgent,
 } from "../../../fixtures/agent-invocations";
+import { neverRunAgentRunner } from "../../../fixtures/agent-runner";
+import { createConversationWorkHarness } from "../../../fixtures/conversation-work";
 import { testViewer } from "../../../fixtures/user";
 
 function stopRequest(
@@ -43,6 +56,19 @@ function stopRequest(
     `http://localhost/api/conversations/${encodeURIComponent(conversationId)}/stop`,
     { method: "POST" },
   );
+}
+
+/** List the event types of the child agent input in a parent mailbox. */
+async function parentMailboxEventTypes(
+  conversationId: string,
+  state: ConversationFixture["state"],
+): Promise<string[]> {
+  const messages =
+    (await getConversationWorkState({ conversationId, state }))?.messages ?? [];
+  return messages.flatMap((message) => {
+    const metadata = message.input.metadata;
+    return isEventMailboxMetadata(metadata) ? [metadata.event.eventType] : [];
+  });
 }
 
 /** Start a web Turn that already took its input and still holds its lease. */
@@ -211,39 +237,108 @@ describe("conversation stop API", () => {
     await expectChildAgentStopped(child, state);
   });
 
-  it("leaves the stop report of a child agent Conversation to its worker", async () => {
-    const fixture = await createConversationFixture();
+  it("reports a person's stop of a child agent to its parent and stops the agents below it", async () => {
+    const runner = abortableAgentRunner();
+    const work = await createConversationWorkHarness(runner.agentRunner);
+    const fixture = {
+      ...(await createConversationFixture()),
+      queue: work.queue,
+    };
     const { actor, conversationStore, queue, state } = fixture;
     const { created } = await startParentTurn(fixture, "stop-child-root");
-    const child = await startRunningChildAgent({
+    const child = await spawnChildAgent({
       conversationStore,
       idempotencyKey: "stop-child-directly",
       parentConversationId: created.conversationId,
       queue,
       state,
     });
-    const { childConversationId, invocationId } = child.invocation;
+    const helper = await createAgentInvocation({
+      ...invocationInput,
+      idempotencyKey: "stop-child-helper",
+      parentConversationId: child.childConversationId,
+    });
+    const processing = work.process(
+      queue.takeMessageFor(child.childConversationId),
+    );
+    await runner.started();
 
+    // Access to a child agent Conversation comes from its root.
     const response = await stopRequest(
       fixture,
-      childConversationId,
+      child.childConversationId,
       actor.email,
     );
     expect(response.status).toBe(200);
     expect(
       stopConversationTurnResponseSchema.parse(await response.json()),
     ).toMatchObject({ status: "requested" });
-    // The agent invocation stays open, so the child's worker records the
-    // stop and reports it to the parent.
-    await expect(getAgentInvocation(invocationId)).resolves.toMatchObject({
-      status: "pending",
-    });
+    await expect(processing).resolves.toMatchObject({ status: "completed" });
+
+    await expect(getAgentInvocation(child.invocationId)).resolves.toMatchObject(
+      {
+        errorMessage: "Agent invocation was stopped",
+        parentMailboxStatus: "appended",
+        status: "stopped",
+      },
+    );
     await expect(
-      hasConversationStop({
-        conversationId: childConversationId,
-        runId: child.runId,
-        state,
-      }),
-    ).resolves.toBe(true);
+      parentMailboxEventTypes(created.conversationId, state),
+    ).resolves.toEqual(["agent_invocation.stopped"]);
+    await expect(
+      getAgentInvocation(helper.invocationId),
+    ).resolves.toMatchObject({
+      parentMailboxStatus: "skipped",
+      status: "stopped",
+    });
+  });
+
+  it("starts no parent Turn for a child result that waits when a person stops the parent", async () => {
+    const work = await createConversationWorkHarness(neverRunAgentRunner());
+    const fixture = {
+      ...(await createConversationFixture()),
+      queue: work.queue,
+    };
+    const { actor, conversationStore, queue, state } = fixture;
+    const { created, leaseToken } = await startParentTurn(
+      fixture,
+      "stop-result-root",
+    );
+    await completeConversationWork({
+      conversationId: created.conversationId,
+      conversationStore,
+      leaseToken,
+      state,
+    });
+    const child = await spawnChildAgent({
+      conversationStore,
+      idempotencyKey: "stop-result-child",
+      parentConversationId: created.conversationId,
+      queue,
+      state,
+    });
+    const result = (await completeAgentInvocation({
+      invocationId: child.invocationId,
+      result: "Child fact: 42.",
+      status: "completed",
+    })) as TerminalAgentInvocation;
+    await enqueueAgentInvocationResult(result, { queue, state });
+    await expect(
+      parentMailboxEventTypes(created.conversationId, state),
+    ).resolves.toEqual(["agent_invocation.completed"]);
+
+    const response = await stopRequest(
+      fixture,
+      created.conversationId,
+      actor.email,
+    );
+    expect(response.status).toBe(200);
+    await expect(
+      work.process(queue.takeMessageFor(created.conversationId)),
+    ).resolves.toMatchObject({ status: "completed" });
+    await expect(
+      parentMailboxEventTypes(created.conversationId, state),
+    ).resolves.toEqual([]);
+    await expect(loadTurnEvents(created.conversationId)).resolves.toEqual([]);
   });
 });

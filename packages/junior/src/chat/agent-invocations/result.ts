@@ -337,6 +337,21 @@ function childAgentInput(message: InboundMessage): ChildAgentInput | undefined {
 }
 
 /**
+ * Return whether a stop after this result was sent skipped it, so it starts no
+ * work. A message that a child sent before its stop is still delivered.
+ */
+function isSkippedAgentResult(
+  input: ChildAgentInput,
+  invocation: AgentInvocation,
+): boolean {
+  return (
+    input.kind === "result" &&
+    isTerminalAgentInvocation(invocation) &&
+    invocation.parentMailboxStatus === "skipped"
+  );
+}
+
+/**
  * Read the agent invocation of one result or message and check that it
  * belongs to a child of the Conversation that received it.
  */
@@ -424,14 +439,7 @@ async function startAgentInvocationsForChildInput(
   for (const [index, message] of messages.entries()) {
     const input = inputs[index]!;
     const source = await getChildAgentInputInvocation(message, input);
-    // The child was stopped after this result was sent. A message that a
-    // child sent before its stop is still delivered, as it is for a root
-    // parent.
-    if (
-      input.kind === "result" &&
-      isTerminalAgentInvocation(source) &&
-      source.parentMailboxStatus === "skipped"
-    ) {
+    if (isSkippedAgentResult(input, source)) {
       continue;
     }
     const invocation = await createAgentInvocationFromLatest({
@@ -485,14 +493,15 @@ export function createChildConversationWorker(
  * Run each agent invocation result or message as the Actor that triggered the
  * child, user or system. This is on purpose: the result continues that
  * Actor's work. The Actor comes from SQL, not from mailbox metadata, so the
- * parent Turn has the same authority it had at spawn time.
+ * parent Turn has the same authority it had at spawn time. A result that a
+ * stop skipped is dropped. Returns undefined when no input is left.
  *
  * TODO(dcramer): Pass the delegated credential subject of a system Actor, such
  * as a timer watch Turn, when system Turns can spawn children that need it.
  */
 export async function withAgentInvocationResultActors(
   work: MailboxTurnWork,
-): Promise<MailboxTurnWork> {
+): Promise<MailboxTurnWork | undefined> {
   if (work.kind !== "mailbox") {
     return work;
   }
@@ -506,8 +515,11 @@ export async function withAgentInvocationResultActors(
         entry.message,
         input,
       );
-      return { ...entry, actor: invocation.actor };
+      return isSkippedAgentResult(input, invocation)
+        ? undefined
+        : { ...entry, actor: invocation.actor };
     }),
   );
-  return { kind: "mailbox", batch };
+  const kept = batch.filter((entry) => entry !== undefined);
+  return kept.length > 0 ? { kind: "mailbox", batch: kept } : undefined;
 }

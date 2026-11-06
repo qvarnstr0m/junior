@@ -192,10 +192,13 @@ export function createConversationWork(
     }
     const mailboxTurn = await resolveMailboxTurnWork(context);
     if (mailboxTurn) {
-      return await conversationTurnWorker(
-        context,
-        await withAgentInvocationResultActors(mailboxTurn),
-      );
+      const work = await withAgentInvocationResultActors(mailboxTurn);
+      if (!work) {
+        // A stop skipped every child result in this input.
+        await context.attempt.ack();
+        return { status: "completed" };
+      }
+      return await conversationTurnWorker(context, work);
     }
     const dispatchId = await resolveAgentDispatchId(context);
     if (dispatchId) {

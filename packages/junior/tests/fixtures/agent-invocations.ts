@@ -15,7 +15,12 @@ import {
   hasConversationStop,
   startConversationWork,
 } from "@/chat/task-execution/store";
-import type { ConversationWorkQueueTestAdapter } from "./conversation-work";
+import type { AgentRun } from "@/chat/agent/types";
+import type { AgentRunner } from "@/chat/runtime/agent-runner";
+import {
+  deferred,
+  type ConversationWorkQueueTestAdapter,
+} from "./conversation-work";
 import { createConfiguredJuniorSqlFixture } from "./sql";
 export const parentConversationId = "local:test:parent-agent";
 export const destination = {
@@ -104,18 +109,18 @@ export async function loadMessageEvents(conversationId: string) {
     .filter((data) => data.type === "message");
 }
 
-/**
- * Start a child agent of a parent and hold its work lease, like a child
- * worker whose run has not finished.
- */
-export async function startRunningChildAgent(args: {
+type ChildAgentArgs = {
   conversationStore: ConversationStore;
   idempotencyKey: string;
   parentConversationId: string;
   queue: ConversationWorkQueueTestAdapter;
   state: StateAdapter;
-}): Promise<{ invocation: AgentInvocation; runId: string }> {
-  // A child agent reports to the destination of the parent's run.
+};
+
+/** Spawn a child agent that reports to the destination of the parent's run. */
+export async function spawnChildAgent(
+  args: ChildAgentArgs,
+): Promise<AgentInvocation> {
   const destination = (
     await getConversationWorkState({
       conversationId: args.parentConversationId,
@@ -125,7 +130,7 @@ export async function startRunningChildAgent(args: {
   if (!destination) {
     throw new Error("Expected a parent Conversation with a destination");
   }
-  const invocation = await createAndEnqueueAgentInvocation(
+  return await createAndEnqueueAgentInvocation(
     {
       ...invocationInput,
       destination,
@@ -134,6 +139,16 @@ export async function startRunningChildAgent(args: {
     },
     args,
   );
+}
+
+/**
+ * Start a child agent of a parent and hold its work lease, like a child
+ * worker whose run has not finished.
+ */
+export async function startRunningChildAgent(
+  args: ChildAgentArgs,
+): Promise<{ invocation: AgentInvocation; runId: string }> {
+  const invocation = await spawnChildAgent(args);
   // The child worker took its wake, so a queue drain does not run it.
   args.queue.takeMessageFor(invocation.childConversationId);
   const lease = await startConversationWork({
@@ -176,4 +191,39 @@ export async function expectChildAgentStopped(
   await expect(listChildAgents(parentConversationId)).resolves.toEqual([
     expect.objectContaining({ childConversationId, status: "stopped" }),
   ]);
+}
+
+/** Wait until the run is aborted, then fail like an aborted agent run. */
+async function waitForAbort(run: AgentRun): Promise<never> {
+  const signal = run.signal;
+  if (!signal) {
+    throw new Error("Child run has no stop signal");
+  }
+  if (!signal.aborted) {
+    await new Promise((resolve) =>
+      signal.addEventListener("abort", resolve, { once: true }),
+    );
+  }
+  throw signal.reason;
+}
+
+/** Run each child until a stop aborts it, and report when it starts. */
+export function abortableAgentRunner() {
+  let started = deferred<void>();
+  const runs: AgentRun[] = [];
+  return {
+    agentRunner: {
+      run: async (run: AgentRun) => {
+        runs.push(run);
+        started.resolve(undefined);
+        return await waitForAbort(run);
+      },
+    } satisfies AgentRunner,
+    runs,
+    /** Wait for the next run to start. */
+    started: async () => {
+      await started.promise;
+      started = deferred<void>();
+    },
+  };
 }

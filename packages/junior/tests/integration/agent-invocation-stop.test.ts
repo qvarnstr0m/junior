@@ -1,5 +1,4 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import type { AgentRun } from "@/chat/agent/types";
 import { enqueueAgentInvocationResult } from "@/chat/agent-invocations/result";
 import {
   completeAgentInvocation,
@@ -26,16 +25,14 @@ import {
 import { createSearchAgentsTool } from "@/chat/tools/runtime/search-agents";
 import { createStopAgentTool } from "@/chat/tools/runtime/stop-agent";
 import {
+  abortableAgentRunner,
   invocationInput,
   loadSubagentEvents,
   loadTurnEvents,
   parentConversationId,
   prepareParentConversation,
 } from "../fixtures/agent-invocations";
-import {
-  createConversationWorkHarness,
-  deferred,
-} from "../fixtures/conversation-work";
+import { createConversationWorkHarness } from "../fixtures/conversation-work";
 
 async function stopAgent(
   conversationId: string,
@@ -52,20 +49,6 @@ async function searchAgents() {
     await createSearchAgentsTool({ conversationId: parentConversationId })
       .execute!({}, {})
   ).agents;
-}
-
-/** Wait until the run is aborted, then fail like an aborted agent run. */
-async function waitForAbort(run: AgentRun): Promise<never> {
-  const signal = run.signal;
-  if (!signal) {
-    throw new Error("Child run has no stop signal");
-  }
-  if (!signal.aborted) {
-    await new Promise((resolve) =>
-      signal.addEventListener("abort", resolve, { once: true }),
-    );
-  }
-  throw signal.reason;
 }
 
 /**
@@ -97,27 +80,6 @@ async function createHarness(agentRunner: AgentRunner) {
         { conversationStore, queue, state },
       ),
     state,
-  };
-}
-
-/** Run each child until a stop aborts it, and report when it starts. */
-function abortableAgentRunner() {
-  let started = deferred<void>();
-  const runs: AgentRun[] = [];
-  return {
-    agentRunner: {
-      run: async (run: AgentRun) => {
-        runs.push(run);
-        started.resolve(undefined);
-        return await waitForAbort(run);
-      },
-    } satisfies AgentRunner,
-    runs,
-    /** Wait for the next run to start. */
-    started: async () => {
-      await started.promise;
-      started = deferred<void>();
-    },
   };
 }
 

@@ -81,19 +81,22 @@ export async function stopChildAgentsOf(
 }
 
 /**
- * Stop every child agent below a root Conversation after a person stops its
- * Turn. A child agent Conversation is left alone: the tree stop would mark
- * its own agent invocation `skipped`, so its parent would get no result. Its
- * worker records the stop, reports it, and stops its own child agents.
+ * Stop every child agent below a Conversation that a person stops. The
+ * Conversation's own agent invocations stay as they are: when it is a child
+ * agent, its worker records the stop and reports it to its parent.
  */
-export async function stopChildAgentsOfRoot(
+export async function stopChildAgentsBelow(
   conversationId: string,
   state?: StateAdapter,
 ): Promise<void> {
-  if (await getLatestAgentInvocationForConversation(conversationId)) {
-    return;
-  }
-  await stopChildAgentsOf(conversationId, state);
+  const tree = await stopAgentInvocationTree(conversationId, Date.now(), {
+    includeRoot: false,
+  });
+  await finishStoppedTree(
+    tree,
+    tree.conversationIds.filter((id) => id !== conversationId),
+    state,
+  );
 }
 
 async function finishStoppedTree(
@@ -200,27 +203,34 @@ export type StoppedAgentTree = {
 /**
  * Stop the agent invocations of one agent Conversation and of every child
  * agent below it. Open agent invocations become `stopped`. Results that would
- * still start or report work in the tree become `skipped`.
+ * still start or report work in the tree become `skipped`. With
+ * `includeRoot: false`, the agent invocations of the Conversation itself stay
+ * as they are, but results sent to it are still `skipped`.
  */
 export async function stopAgentInvocationTree(
   conversationId: string,
   nowMs = Date.now(),
+  options: { includeRoot: boolean } = { includeRoot: true },
 ): Promise<StoppedAgentTree> {
   // One transaction holds the create locks of the tree until every write is
   // done. A child agent that starts later finds its parent stopped.
   return await getSqlExecutor().withLock(
     getChildAgentLockName(conversationId),
-    () => stopLockedAgentInvocationTree(conversationId, nowMs),
+    () => stopLockedAgentInvocationTree(conversationId, nowMs, options),
   );
 }
 
 async function stopLockedAgentInvocationTree(
   conversationId: string,
   nowMs: number,
+  options: { includeRoot: boolean },
 ): Promise<StoppedAgentTree> {
   const db = getSqlExecutor().db();
   const now = new Date(nowMs);
   const conversationIds = await lockAgentConversationTree(conversationId);
+  const stoppedChildIds = options.includeRoot
+    ? conversationIds
+    : conversationIds.filter((id) => id !== conversationId);
   // Stop open work first. After this write no agent invocation in the tree
   // can finish, so no new result can appear.
   const stopped = await db
@@ -235,7 +245,7 @@ async function stopLockedAgentInvocationTree(
     })
     .where(
       and(
-        inArray(juniorAgentInvocations.childConversationId, conversationIds),
+        inArray(juniorAgentInvocations.childConversationId, stoppedChildIds),
         inArray(
           juniorAgentInvocations.status,
           NON_TERMINAL_AGENT_INVOCATION_STATUSES,
@@ -258,7 +268,7 @@ async function stopLockedAgentInvocationTree(
         ),
         // No later agent invocation in the tree sends a `replaced` report.
         and(
-          inArray(juniorAgentInvocations.childConversationId, conversationIds),
+          inArray(juniorAgentInvocations.childConversationId, stoppedChildIds),
           eq(juniorAgentInvocations.parentMailboxStatus, "replaced"),
         ),
       ),

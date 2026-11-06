@@ -29,7 +29,7 @@ import {
 import { appendConversationMessages } from "@/chat/conversations/messages";
 import { stopConversationTurn } from "@/chat/conversations/stop";
 import {
-  stopChildAgentsOfRoot,
+  stopChildAgentsBelow,
   stopConversationSession,
 } from "@/chat/agent-invocations/stop";
 import type { ConversationWorkQueue } from "@/chat/task-execution/queue";
@@ -428,14 +428,15 @@ async function handleSlackSessionStop(args: {
     conversationStore: args.conversationStore,
     installation: args.installation,
   });
+  // Stop the child agents first, so a failure leaves the Turn running. A
+  // child agent can outlive the parent Turn, so this runs even with no Turn.
+  await stopChildAgentsBelow(conversationId, args.state);
   const stopped = await stopConversationTurn({
     conversationId,
     conversationStore: args.conversationStore,
     queue: args.queue,
     state: args.state,
   });
-  // A child agent can outlive the parent Turn, so stop it even with no Turn.
-  await stopChildAgentsOfRoot(conversationId, args.state);
   await createSlackWebApiStatusSender({
     channelId: args.channelId,
     threadTs: args.threadTs,
