@@ -23,7 +23,10 @@ import {
 } from "@/chat/agent-invocations/result";
 import { botConfig } from "@/chat/config";
 import { skipInputBeforeConversationStop } from "@/chat/conversations/session-stop";
-import { resolveThreadTurnWork } from "@/chat/agent-invocations/thread-turn";
+import {
+  requestPersonTurnAfterInvocation,
+  resolveThreadTurnWork,
+} from "@/chat/agent-invocations/thread-turn";
 import { createConversationTurnWorker } from "@/chat/task-execution/conversation-turn";
 import { resolveMailboxTurnWork } from "@/chat/task-execution/mailbox-turn";
 import {
@@ -192,9 +195,14 @@ export function createConversationWork(
     });
     if (conversation?.kind === "thread") {
       const threadTurn = await resolveThreadTurnWork(context);
-      return threadTurn
-        ? await conversationTurnWorker(context, threadTurn)
-        : await childWorker(context);
+      if (threadTurn) {
+        return await conversationTurnWorker(context, threadTurn);
+      }
+      const result = await childWorker(context);
+      if (result.status === "completed") {
+        await requestPersonTurnAfterInvocation(context, options.state);
+      }
+      return result;
     }
     if (conversation?.parentConversationId) {
       return await childWorker(context);

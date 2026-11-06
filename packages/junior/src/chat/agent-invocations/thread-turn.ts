@@ -5,6 +5,7 @@
  * worker.
  */
 import type { Destination } from "@sentry/junior-plugin-api";
+import type { StateAdapter } from "chat";
 import type { LocationConfigurationService } from "@/chat/configuration/types";
 import { hydrateConversationMessages } from "@/chat/conversations/messages";
 import type { Conversation } from "@/chat/conversations/store";
@@ -17,17 +18,23 @@ import {
   parseWebMessages,
   type MailboxTurnWork,
 } from "@/chat/task-execution/mailbox-turn";
+import { getTurnAuthorization } from "@/chat/task-execution/authorized-turn";
+import { getTurnRecord } from "@/chat/task-execution/checkpoint";
+import { requestConversationWork } from "@/chat/task-execution/store";
 import type { ConversationWorkerContext } from "@/chat/task-execution/worker";
 import {
   getActiveAgentInvocationForConversation,
+  getAgentInvocationTurnId,
   getLatestAgentInvocationForConversation,
 } from "./store";
+import type { AgentInvocation } from "./types";
 import { readChildDepthAndRootLocation } from "./work";
 
 /**
  * Select the web Turn work of a Thread, or undefined for work that belongs to
- * an Agent invocation. An empty attempt resumes an open Agent invocation
- * first, so a person's Turn that waits for sign-in cannot starve it.
+ * an Agent invocation. One empty wake can be for either. A paused slice of
+ * the open Agent invocation goes first, then a person's Turn that can resume.
+ * Other empty wakes go to the open Agent invocation.
  */
 export async function resolveThreadTurnWork(
   context: ConversationWorkerContext,
@@ -36,14 +43,75 @@ export async function resolveThreadTurnWork(
   if (batch.length > 0) {
     return { kind: "mailbox", batch };
   }
-  if (
-    context.attempt.messages.length > 0 ||
-    (await getActiveAgentInvocationForConversation(context.conversationId))
-  ) {
+  if (context.attempt.messages.length > 0) {
     return undefined;
   }
-  const turnId = await getActiveConversationTurnId(context.conversationId);
-  return turnId ? { kind: "resume", turnId } : undefined;
+  const [invocation, turnId] = await Promise.all([
+    getActiveAgentInvocationForConversation(context.conversationId),
+    getActiveConversationTurnId(context.conversationId),
+  ]);
+  if (!turnId) {
+    return undefined;
+  }
+  if (
+    !invocation ||
+    ((await canResumePersonTurn(context.conversationId, turnId)) &&
+      !(await canResumeInvocationSlice(context.conversationId, invocation)))
+  ) {
+    return { kind: "resume", turnId };
+  }
+  return undefined;
+}
+
+/**
+ * Ask for one more attempt after Agent invocation work when a person's Turn
+ * can resume. Its wake can go to the Agent invocation, and nothing else
+ * wakes it again.
+ */
+export async function requestPersonTurnAfterInvocation(
+  context: ConversationWorkerContext,
+  state?: StateAdapter,
+): Promise<void> {
+  const [invocation, turnId] = await Promise.all([
+    getActiveAgentInvocationForConversation(context.conversationId),
+    getActiveConversationTurnId(context.conversationId),
+  ]);
+  if (
+    !turnId ||
+    !(await canResumePersonTurn(context.conversationId, turnId)) ||
+    (invocation &&
+      (await canResumeInvocationSlice(context.conversationId, invocation)))
+  ) {
+    return;
+  }
+  await requestConversationWork({
+    conversationId: context.conversationId,
+    destination: undefined,
+    state,
+  });
+}
+
+/** A sign-in pause can resume only after its sign-in is recorded. */
+async function canResumePersonTurn(
+  conversationId: string,
+  turnId: string,
+): Promise<boolean> {
+  const turn = await getTurnRecord(conversationId, turnId);
+  if (turn?.state !== "paused") {
+    return false;
+  }
+  return turn.resumeReason !== "auth" || !!(await getTurnAuthorization(turn));
+}
+
+async function canResumeInvocationSlice(
+  conversationId: string,
+  invocation: AgentInvocation,
+): Promise<boolean> {
+  const turn = await getTurnRecord(
+    conversationId,
+    getAgentInvocationTurnId(invocation.invocationId),
+  );
+  return turn?.state === "paused" && turn.resumeReason !== "auth";
 }
 
 /** Run context of a person's Turn in a Thread. */

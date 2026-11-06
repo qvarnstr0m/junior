@@ -5,7 +5,9 @@ import { createAcpConversations } from "@/api/acp/conversations";
 import { bindMessageAgent } from "@/chat/agent-invocations/message";
 import {
   completeAgentInvocation,
+  createAgentInvocationForMessage,
   getActiveAgentInvocationForConversation,
+  markAgentInvocationRunning,
 } from "@/chat/agent-invocations/store";
 import { createAndEnqueueAgentInvocation } from "@/chat/agent-invocations/work";
 import type { AgentRun } from "@/chat/agent/types";
@@ -28,6 +30,7 @@ import {
   getTurnRecord,
   saveTurnCheckpoint,
 } from "@/chat/task-execution/checkpoint";
+import { recordTurnAuthorization } from "@/chat/task-execution/authorized-turn";
 import { getAuthPausedConversationTurnId } from "@/chat/task-execution/mailbox-turn";
 import { getConversationWorkState } from "@/chat/task-execution/store";
 import { wakePausedTurn } from "@/chat/task-execution/turn-wake";
@@ -324,6 +327,56 @@ describe("Thread input", () => {
       await expect(
         harness.conversationStore.get({ conversationId: threadId }),
       ).resolves.not.toHaveProperty("destination");
+    } finally {
+      await harness.close();
+    }
+  });
+
+  it("resumes a person's Turn when sign-in completes during an Agent invocation", async () => {
+    const harness = await createHarness();
+    try {
+      const threadId = await startThread(harness, "thread-spawn");
+      await harness.process(threadId);
+      await finishInvocation(harness, threadId);
+      const personTurnId = await savePersonTurnPausedForSignIn(threadId);
+      // The parent's next Agent invocation runs elsewhere and has no paused
+      // slice for the wake.
+      const { invocation } = await createAgentInvocationForMessage({
+        actor: slackInvocationInput.actor,
+        childConversationId: threadId,
+        destination: slackDestination,
+        idempotencyKey: "thread-next",
+        input: "Also check the retry path.",
+        parentConversationId: slackParentConversationId,
+        parentToolCallId: "call-next",
+      });
+      await markAgentInvocationRunning(invocation.invocationId);
+      const runCount = harness.runs.length;
+
+      // The sign-in callback records sign-in and sends one empty wake.
+      const request = await recordTurnAuthorization({
+        actorId: "U123",
+        authorizationId: "authorization-1",
+        conversationId: threadId,
+        destination: slackDestination,
+        kind: "plugin",
+        provider: "github",
+        turnId: personTurnId,
+      });
+      await wakePausedTurn(request!, {
+        conversationStore: harness.conversationStore,
+        queue: harness.queue,
+        state: harness.state,
+      });
+      await harness.process(threadId);
+
+      const resumed = harness.runs.slice(runCount);
+      expect(resumed).toHaveLength(1);
+      expect(resumed[0]).toMatchObject({
+        actor: { platform: "web" },
+        turnId: personTurnId,
+      });
+      expect(resumed[0]?.agentInvocationId).toBeUndefined();
     } finally {
       await harness.close();
     }
