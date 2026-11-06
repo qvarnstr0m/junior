@@ -28,7 +28,10 @@ import {
 } from "@/chat/db";
 import { appendConversationMessages } from "@/chat/conversations/messages";
 import { stopConversationTurn } from "@/chat/conversations/stop";
-import { stopConversationSession } from "@/chat/agent-invocations/stop";
+import {
+  stopChildAgentsOf,
+  stopConversationSession,
+} from "@/chat/agent-invocations/stop";
 import type { ConversationWorkQueue } from "@/chat/task-execution/queue";
 import {
   appendAndEnqueueInboundMessage,
@@ -404,9 +407,10 @@ export const SLACK_SESSION_STOP_ACK = "Stopped.";
 /**
  * Stop the active Turn when a user clicks Slack's native agent stop button.
  *
- * Unlike the `stop` keyword, this only interrupts current work. The thread
- * stays subscribed and resource watches stay active. Slack does not leave the
- * `processing` status by itself, so clear the status even when no work runs.
+ * Unlike the `stop` keyword, this only interrupts current work and the child
+ * agents below it. The thread stays subscribed and resource watches stay
+ * active. Slack does not leave the `processing` status by itself, so clear the
+ * status even when no work runs.
  * https://docs.slack.dev/reference/events/agent_session_stopped
  */
 async function handleSlackSessionStop(args: {
@@ -430,6 +434,8 @@ async function handleSlackSessionStop(args: {
     queue: args.queue,
     state: args.state,
   });
+  // A child agent can outlive the parent Turn, so stop it even with no Turn.
+  await stopChildAgentsOf(conversationId, args.state);
   await createSlackWebApiStatusSender({
     channelId: args.channelId,
     threadTs: args.threadTs,

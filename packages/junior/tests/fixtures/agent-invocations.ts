@@ -115,13 +115,20 @@ export async function startRunningChildAgent(args: {
   queue: ConversationWorkQueueTestAdapter;
   state: StateAdapter;
 }): Promise<{ invocation: AgentInvocation; runId: string }> {
+  // A child agent reports to the destination of the parent's run.
+  const destination = (
+    await getConversationWorkState({
+      conversationId: args.parentConversationId,
+      state: args.state,
+    })
+  )?.destination;
+  if (!destination) {
+    throw new Error("Expected a parent Conversation with a destination");
+  }
   const invocation = await createAndEnqueueAgentInvocation(
     {
       ...invocationInput,
-      destination: {
-        conversationId: args.parentConversationId,
-        platform: "local",
-      },
+      destination,
       idempotencyKey: args.idempotencyKey,
       parentConversationId: args.parentConversationId,
     },
