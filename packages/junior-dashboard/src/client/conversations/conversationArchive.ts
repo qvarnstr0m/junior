@@ -8,6 +8,7 @@ import {
 import type {
   ConversationDetailReport,
   ConversationFeed,
+  ConversationFeedItem,
   ConversationSummaryReport,
 } from "@sentry/junior/api/schema";
 import { archiveConversationResponseSchema } from "@sentry/junior/api/schema";
@@ -327,4 +328,130 @@ function buildArchivedConversationSnapshot(
     feedQueryHashes.push(JSON.stringify(queryKey));
   }
   return conversation ? { conversation, feedQueryHashes } : undefined;
+}
+
+type ThreadArchiveMutationContext = {
+  detailQueryKey: ReturnType<typeof conversationDetailQueryKey>;
+  previousDetail?: ConversationDetailReport;
+  previousFeeds: Array<[readonly unknown[], ConversationFeed | undefined]>;
+};
+
+/** Drop one Thread from the nested `threads` of feed rows, at any depth. */
+function withoutThread(
+  rows: ConversationFeedItem[],
+  threadId: string,
+): ConversationFeedItem[] {
+  return rows.map((row) => {
+    if (!row.threads) return row;
+    const { threads, ...rest } = row;
+    const kept = withoutThread(
+      threads.filter((thread) => thread.conversationId !== threadId),
+      threadId,
+    );
+    return kept.length ? { ...rest, threads: kept } : rest;
+  });
+}
+
+/**
+ * Archive or restore one Thread for everyone. It sets `threadArchivedAt`, not
+ * the viewer's `archivedAt`. Archive hides the Thread from the feed at once.
+ * Restore waits for the refetch, because the feed has no copy of an archived
+ * Thread to put back.
+ */
+export function useArchiveThread(
+  conversationId: string,
+  options?: ArchiveConversationOptions,
+) {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationKey: [...archiveConversationMutationKey, conversationId],
+    mutationFn: (args: ArchiveConversationVariables) =>
+      patch(
+        archiveConversationResponseSchema,
+        `/api/conversations/${encodeURIComponent(conversationId)}/archive`,
+        args,
+      ),
+    onMutate: async (args) => {
+      const conversationQueries = { queryKey: ["dashboard", "conversations"] };
+      const detailQueryKey = conversationDetailQueryKey(conversationId);
+      await Promise.all([
+        queryClient.cancelQueries(conversationQueries),
+        queryClient.cancelQueries({ queryKey: detailQueryKey }),
+      ]);
+      const previousFeeds =
+        queryClient.getQueriesData<ConversationFeed>(conversationQueries);
+      const previousDetail =
+        queryClient.getQueryData<ConversationDetailReport>(detailQueryKey);
+      if (args.archived) {
+        previousFeeds.forEach(([queryKey, feed]) => {
+          if (!feed) return;
+          queryClient.setQueryData<ConversationFeed>(queryKey, {
+            ...feed,
+            conversations: withoutThread(feed.conversations, conversationId),
+          });
+        });
+      }
+      queryClient.setQueryData<ConversationSnapshot>(
+        detailQueryKey,
+        (detail) =>
+          detail
+            ? {
+                ...detail,
+                threadArchivedAt: args.archived
+                  ? new Date().toISOString()
+                  : null,
+                detailEtag: undefined,
+              }
+            : detail,
+      );
+      return {
+        detailQueryKey,
+        previousDetail,
+        previousFeeds,
+      } satisfies ThreadArchiveMutationContext;
+    },
+    onError: (_error, _args, context) => {
+      context?.previousFeeds.forEach(([queryKey, feed]) => {
+        queryClient.setQueryData(queryKey, feed);
+      });
+      if (context) {
+        queryClient.setQueryData(
+          context.detailQueryKey,
+          context.previousDetail,
+        );
+      }
+      options?.onError?.();
+    },
+    onSuccess: (result) => {
+      queryClient.setQueryData<ConversationSnapshot>(
+        conversationDetailQueryKey(conversationId),
+        (detail) =>
+          detail
+            ? {
+                ...detail,
+                threadArchivedAt: result.archivedAt,
+                detailEtag: undefined,
+              }
+            : detail,
+      );
+      options?.onSuccess?.(result.archivedAt);
+    },
+    onSettled: async () => {
+      await Promise.all([
+        queryClient.invalidateQueries({
+          queryKey: ["dashboard", "conversations"],
+        }),
+        queryClient.invalidateQueries({
+          exact: true,
+          queryKey: conversationDetailQueryKey(conversationId),
+        }),
+        // The parent's Threads list reads the child agents report.
+        queryClient.invalidateQueries({
+          predicate: (query) =>
+            query.queryKey[0] === "conversation" &&
+            query.queryKey[2] === "agents",
+        }),
+      ]);
+    },
+  });
 }

@@ -12,7 +12,11 @@ import { conversationSummaryFromStoredConversation } from "./projection";
 
 /** Bound the parent chain that one agent tree reads. */
 const MAX_AGENT_TREE_DEPTH = 16;
-const CHILD_LABEL = "Subagent";
+
+/** Name a child the viewer cannot read, or one with no agent label. */
+function childLabel(kind: ConversationKind): string {
+  return kind === "thread" ? "Thread" : "Task";
+}
 
 async function readTreeNode(
   conversationId: string,
@@ -98,13 +102,13 @@ export async function readConversationAgentTree(
       // The walk above read every id in the chain.
       const kind = kindById.get(id) ?? "task";
       if (!itemAccess?.canViewPrivateContent) {
-        return { conversationId: id, kind, label: CHILD_LABEL };
+        return { conversationId: id, kind, label: childLabel(kind) };
       }
       const agent = await getChildAgentLabel(id);
       return {
         conversationId: id,
         kind,
-        label: agent?.title ?? agent?.agentName ?? CHILD_LABEL,
+        label: agent?.title ?? agent?.agentName ?? childLabel(kind),
       };
     }),
   );

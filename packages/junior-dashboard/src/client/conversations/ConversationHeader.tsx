@@ -31,7 +31,8 @@ export function ConversationHeader(props: {
   contextTags?: ReactNode;
   /** A `menu` layout copy action for the `⋯` menu. */
   copyAction?: ReactNode;
-  archive: ConversationArchiveAction;
+  /** Absent on Task pages, which cannot be archived. */
+  archive?: ConversationArchiveAction;
   conversationId: string;
   /** Estimated cost. Desktop only; mobile shows it in Conversation details. */
   cost?: ReactNode;
@@ -118,7 +119,7 @@ export function ConversationHeader(props: {
 
   const showMobileHeader =
     searchOpenVisible ||
-    props.archive.error ||
+    props.archive?.error ||
     props.pin.error ||
     Boolean(props.forks) ||
     Boolean(props.agentTree);
@@ -273,7 +274,7 @@ export function ConversationHeader(props: {
             />
           </div>
         ) : null}
-        {props.archive.error ? (
+        {props.archive?.error ? (
           <div className="px-4 pb-3 text-xs text-red-300 md:px-7">
             Could not update archive state.
           </div>

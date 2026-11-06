@@ -43,7 +43,7 @@ export type ConversationPinAction = {
  * available there on mobile too.
  */
 export function ConversationHeaderActions(props: {
-  archive: ConversationArchiveAction;
+  archive?: ConversationArchiveAction;
   pin: ConversationPinAction;
   conversationId: string;
   copyAction?: ReactNode;
@@ -122,7 +122,7 @@ export function ConversationHeaderActions(props: {
           <Pin aria-hidden="true" size={16} strokeWidth={2} />
         )}
       </MenuActionButton>
-      <ArchiveConversationButton {...props.archive} />
+      {props.archive ? <ArchiveConversationButton {...props.archive} /> : null}
     </div>
   );
 }

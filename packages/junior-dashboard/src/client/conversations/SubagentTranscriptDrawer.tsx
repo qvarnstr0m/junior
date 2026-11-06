@@ -63,7 +63,9 @@ function SubagentTranscriptDrawerContent(props: {
 
   const detail = query.data;
   const label =
-    props.target.label ?? conversationDetailTitle(detail) ?? "Subagent";
+    props.target.label ??
+    conversationDetailTitle(detail) ??
+    (detail?.kind === "thread" ? "Thread" : "Task");
   const status = statusLabel(props.target.status, detail?.status);
   const agentName =
     props.target.agentName && props.target.agentName !== label
@@ -108,7 +110,7 @@ function SubagentTranscriptDrawerContent(props: {
           />
         </>
       }
-      closeLabel="Close subagent transcript"
+      closeLabel="Close transcript"
       // The event log owns its row insets and sticky toolbar, like the page.
       flush={view === "raw"}
       header={

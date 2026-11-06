@@ -20,6 +20,7 @@ import type { ConversationData } from "./queries";
 import { ConversationSidePanelLayout } from "./ConversationSidePanelLayout";
 import {
   useArchiveConversation,
+  useArchiveThread,
   type ArchivedFromConversationState,
   type PendingArchiveConversationUpdate,
 } from "./conversationArchive";
@@ -277,7 +278,10 @@ export function ConversationPage(props: {
     }),
     [memoryList, memoryPopover],
   );
-  const archive = useArchiveConversation(conversationId);
+  // Both hooks share one mutation key, so pending state reads the same.
+  const rootArchive = useArchiveConversation(conversationId);
+  const threadArchive = useArchiveThread(conversationId);
+  const archive = detail.data?.kind === "thread" ? threadArchive : rootArchive;
   const navigate = useNavigate();
   const pin = usePinConversation(conversationId);
   const markRead = useMarkConversationRead(conversationId);
@@ -555,6 +559,8 @@ export function ConversationPage(props: {
       {showDetails ? (
         <ConversationMemoryContext value={memoryState}>
           <ConversationDetails
+            agentTree={agentTree}
+            feedConversations={conversations}
             autoArchive={
               detail.data?.autoArchive === undefined ? null : (
                 <AutoArchiveToggle
@@ -710,28 +716,35 @@ export function ConversationPage(props: {
                 onClick: () => pin.mutate(!conversation?.pinnedAt),
                 pinned: Boolean(conversation?.pinnedAt),
               }}
-              archive={{
-                archived: Boolean(conversation?.archivedAt),
-                disabled: !conversation || archive.isPending,
-                error: Boolean(archive.error),
-                onClick: () => {
-                  const archived = !conversation!.archivedAt;
-                  archive.mutate({
-                    archived,
-                    lastSeenAt: conversation!.lastSeenAt,
-                  });
-                  // Archiving hides this conversation, so go home at once.
-                  // The mutation keeps running after this page unmounts.
-                  if (archived) {
-                    navigate("/", {
-                      state: {
-                        archivedConversation: conversation!,
-                      } satisfies ArchivedFromConversationState,
-                    });
-                  }
-                },
-                pending: archive.isPending,
-              }}
+              // A Task archive would archive its root, so Task pages have
+              // no archive action.
+              archive={
+                conversation?.kind === "task"
+                  ? undefined
+                  : {
+                      archived: Boolean(archivedAt(conversation)),
+                      disabled: !conversation || archive.isPending,
+                      error: Boolean(archive.error),
+                      onClick: () => {
+                        const archived = !archivedAt(conversation);
+                        archive.mutate({
+                          archived,
+                          lastSeenAt: conversation!.lastSeenAt,
+                        });
+                        // Archiving hides a root, so go home at once. The
+                        // mutation keeps running after this page unmounts.
+                        // An archived Thread stays readable, so it stays open.
+                        if (archived && conversation!.kind !== "thread") {
+                          navigate("/", {
+                            state: {
+                              archivedConversation: conversation!,
+                            } satisfies ArchivedFromConversationState,
+                          });
+                        }
+                      },
+                      pending: archive.isPending,
+                    }
+              }
               live={live}
               onSearchChange={setSearch}
               onViewChange={onViewChange}
@@ -893,12 +906,21 @@ function applyPendingArchiveUpdate(
       ? buildConversations([update.conversation])[0]
       : undefined);
   if (!updatedConversation || !update) return updatedConversation;
+  const key =
+    updatedConversation.kind === "thread" ? "threadArchivedAt" : "archivedAt";
   return {
     ...updatedConversation,
-    archivedAt: update.archived
-      ? (updatedConversation.archivedAt ?? updatedConversation.lastSeenAt)
+    [key]: update.archived
+      ? (updatedConversation[key] ?? updatedConversation.lastSeenAt)
       : null,
   };
+}
+
+/** Read the archive that the page action sets: the Thread's or the viewer's. */
+function archivedAt(conversation: Conversation | undefined) {
+  return conversation?.kind === "thread"
+    ? conversation.threadArchivedAt
+    : conversation?.archivedAt;
 }
 
 function conversationIsLive(
