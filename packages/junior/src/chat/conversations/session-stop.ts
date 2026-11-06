@@ -1,6 +1,6 @@
 import type { StateAdapter } from "chat";
-import { and, eq, inArray, isNotNull } from "drizzle-orm";
-import { appendConversationMessages } from "@/chat/conversations/messages";
+import { and, eq, inArray, lt, sql } from "drizzle-orm";
+import { toStoredConversationMessage } from "@/chat/conversations/messages";
 import { getConversationEventStore, getSqlExecutor } from "@/chat/db";
 import { instructionForInputs } from "@/chat/agent/prompt";
 import {
@@ -8,13 +8,9 @@ import {
   isEventMailboxMetadata,
   renderEventBatchInputs,
 } from "@/chat/events/notification";
-import { getWatch } from "@/chat/events/store";
+import { cancelSubscriptions, getWatch } from "@/chat/events/store";
 import { eventReviewItemInputs } from "@/chat/review-items/prompt-input";
-import {
-  normalizeConversationText,
-  upsertConversationMessage,
-} from "@/chat/services/conversation-memory";
-import { coerceThreadConversationState } from "@/chat/state/conversation";
+import { normalizeConversationText } from "@/chat/services/conversation-memory";
 import type { InboundMessage } from "@/chat/task-execution/store";
 import type {
   ConversationWorkerContext,
@@ -22,29 +18,45 @@ import type {
 } from "@/chat/task-execution/worker";
 import { juniorConversations } from "@/db/schema";
 import { nextDetailVersion } from "@/chat/conversations/sql/detail-version";
+import {
+  conversationSubtree,
+  conversationSubtreeColumns,
+} from "@/chat/conversations/sql/subtree";
 
 /** Skip reason on the Message that saves Events from passive Watches. */
 const PASSIVE_WATCH_SKIP_REASON = "passive watch";
 
 /**
  * Record a session stop on each Conversation. Automated input received before
- * it is dropped, and the Watches that exist now become passive until a person
- * sends input.
+ * it is dropped. With `watches: "passive"`, a person stopped the
+ * Conversations: their Watches that exist now become passive until a person
+ * sends input. With `watches: "cancel"`, an agent stopped them, so their
+ * Watches end.
  */
 export async function markConversationsStopped(
   conversationIds: readonly string[],
-  nowMs = Date.now(),
+  options: {
+    nowMs?: number;
+    state?: StateAdapter;
+    watches: "cancel" | "passive";
+  },
 ): Promise<void> {
   if (conversationIds.length === 0) {
     return;
   }
-  const at = new Date(nowMs);
+  if (options.watches === "cancel") {
+    // Cancel first, so the worker drops every Event those Watches delivered.
+    for (const conversationId of conversationIds) {
+      await cancelSubscriptions({ conversationId, state: options.state });
+    }
+  }
+  const at = new Date(options.nowMs ?? Date.now());
   await getSqlExecutor()
     .db()
     .update(juniorConversations)
     .set({
       stoppedAt: at,
-      watchesPassiveAt: at,
+      watchesPassiveAt: options.watches === "passive" ? at : null,
       detailVersion: nextDetailVersion,
     })
     .where(inArray(juniorConversations.conversationId, [...conversationIds]));
@@ -57,7 +69,8 @@ export async function getConversationStoppedAtMs(
   return (await readConversationStop(conversationId))?.stoppedAtMs;
 }
 
-async function readConversationStop(conversationId: string): Promise<
+/** Read when a Conversation last stopped and when its Watches became passive. */
+export async function readConversationStop(conversationId: string): Promise<
   | {
       stoppedAtMs?: number;
       watchesPassiveAtMs?: number;
@@ -82,35 +95,51 @@ async function readConversationStop(conversationId: string): Promise<
   };
 }
 
-/** Make a Conversation's passive Watches active again. */
-async function reactivateWatches(conversationId: string): Promise<void> {
+/**
+ * Make the passive Watches of a Conversation and of every child agent below
+ * it active again. Only Watches made passive before `beforeMs` change, so a
+ * stop that came after the input stays in effect.
+ */
+export async function reactivateWatchTree(
+  conversationId: string,
+  beforeMs: number,
+): Promise<void> {
   await getSqlExecutor()
     .db()
     .update(juniorConversations)
     .set({ watchesPassiveAt: null, detailVersion: nextDetailVersion })
     .where(
       and(
-        eq(juniorConversations.conversationId, conversationId),
-        isNotNull(juniorConversations.watchesPassiveAt),
+        inArray(
+          juniorConversations.conversationId,
+          sql`(select ${conversationSubtreeColumns.conversationId} from ${conversationSubtree([conversationId])})`,
+        ),
+        lt(juniorConversations.watchesPassiveAt, new Date(beforeMs)),
       ),
     );
 }
 
 /**
- * Apply the last session stop to automated input. Input from a person makes
- * the Conversation's Watches active again and always runs, as does input from
- * a parent tool call. Events from passive Watches are saved as one Message
- * and start no Turn. Agent results and agent messages received at or before
- * the stop are dropped. Returns undefined when the work should run.
+ * Apply the last session stop to automated input. Input from a person always
+ * runs. When a person sent it after the stop, the Watches of the Conversation
+ * and of its child agents become active again. Input from a parent tool call
+ * also runs. Events from passive Watches are saved as one Message and start
+ * no Turn. Other Events received at or before the stop are dropped. Returns
+ * undefined when the work should run.
  */
 export async function skipInputAfterConversationStop(
   context: ConversationWorkerContext,
   state?: StateAdapter,
 ): Promise<ConversationWorkerResult | undefined> {
   const messages = context.attempt.messages;
-  // Parent agent input does not reactivate Watches: only a person does.
-  if (messages.some(isPersonInput)) {
-    await reactivateWatches(context.conversationId);
+  const personInput = messages.filter(isPersonInput);
+  if (personInput.length > 0) {
+    // The batch can still hold input that the stop cancels. Only input sent
+    // after the stop reactivates the Watches.
+    await reactivateWatchTree(
+      context.conversationId,
+      Math.max(...personInput.map((message) => message.receivedAtMs)),
+    );
     return undefined;
   }
   if (messages.length === 0 || !messages.every(isEventInput)) {
@@ -123,10 +152,10 @@ export async function skipInputAfterConversationStop(
   const passive: InboundMessage[] = [];
   for (const message of messages) {
     const watchId = eventWatchId(message);
-    if (watchId !== undefined) {
-      if (!(await isPassiveWatch(watchId, stop.watchesPassiveAtMs, state))) {
-        return undefined;
-      }
+    if (
+      watchId !== undefined &&
+      (await isPassiveWatch(watchId, stop.watchesPassiveAtMs, state))
+    ) {
       passive.push(message);
     } else if (
       stop.stoppedAtMs === undefined ||
@@ -162,7 +191,11 @@ function eventWatchId(message: InboundMessage): string | undefined {
 
 /**
  * A Watch is passive when it existed at the last session stop and no person
- * sent input after that stop. A Watch that a later Turn created stays active.
+ * sent input after that stop. A Watch that is created or re-created later
+ * stays active.
+ *
+ * Known gap: the running Turn sees the stop only at its next stop signal
+ * check. A Watch that it creates before then stays active.
  */
 async function isPassiveWatch(
   watchId: string,
@@ -176,7 +209,10 @@ async function isPassiveWatch(
   return !watch || watch.createdAtMs <= watchesPassiveAtMs;
 }
 
-/** Save Events as the one Message that a Turn would save for them. */
+/**
+ * Save Events as the one Message that a Turn would save for them. The append
+ * is idempotent by Message id, so a retried batch saves nothing new.
+ */
 async function savePassiveWatchEvents(
   conversationId: string,
   messages: readonly InboundMessage[],
@@ -187,8 +223,7 @@ async function savePassiveWatchEvents(
       (input) => ({ kind: "runtime" as const, text: input }),
     ),
   );
-  const conversation = coerceThreadConversationState(undefined);
-  upsertConversationMessage(conversation, {
+  const stored = toStoredConversationMessage({
     id: first.inboundMessageId,
     role: "user",
     text: normalizeConversationText(text),
@@ -202,8 +237,12 @@ async function savePassiveWatchEvents(
       ...eventBatchMessageMeta(messages),
     },
   });
-  await appendConversationMessages(getConversationEventStore(), {
-    conversation,
-    conversationId,
-  });
+  const { createdAtMs, ...data } = stored;
+  await getConversationEventStore().append(conversationId, [
+    {
+      idempotencyKey: `message:${stored.messageId}`,
+      createdAtMs,
+      data: { type: "message", ...data },
+    },
+  ]);
 }

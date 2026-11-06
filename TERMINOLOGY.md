@@ -60,8 +60,10 @@ Canonical words for Junior code and docs. One concept, one word.
 - **Watch**: a temporary link that delivers matching Events to a Conversation.
   Not an Automation.
 - **Passive Watch**: a Watch whose Events are saved as Messages and start no
-  Turn. A person's stop makes Watches passive; their next input makes them
-  active again. Not a cancelled Watch.
+  Turn. A person's stop makes the Watches of the stopped Conversation and its
+  child agents passive. A person's later input to that Conversation, or new
+  work from a child's parent, makes them active again. An agent's `stopAgent`
+  cancels Watches instead. Not a cancelled Watch.
 - **Event reach**: `"all"`, `{ anyOf }` (needs a named filter), or `"resource"`
   (needs an identifier) per event type. Limits noise, not access.
 - **Inbound message**: one normalized source event given to the agent.

@@ -23,7 +23,7 @@ export function registerStopConversationTool(
     {
       title: "Stop conversation",
       description:
-        "Stop one of your conversations: its running turn and every child agent below it. Their watches become passive: events are saved to the conversation but start no turn, until you send the conversation a message. Messages that wait for the turn are dropped. It starts no new work.",
+        "Stop one of your conversations: its running turn and every child agent below it. Their watches become passive: events are saved to the conversation but start no turn, until you send the conversation a message, which makes the watches of it and its child agents active again. Messages that wait for the turn are dropped. It starts no new work.",
       inputSchema: { conversationId: mcpConversationIdSchema },
       outputSchema: {
         status: z

@@ -2,7 +2,8 @@ import { afterEach, expect, it, vi } from "vitest";
 import { runHeartbeat } from "@/chat/agent-dispatch/heartbeat";
 import { stopConversation } from "@/chat/conversations/stop";
 import { getEventCatalog } from "@/chat/events/runtime-catalog";
-import { takeDueTimerWatches } from "@/chat/events/store";
+import { enqueueEventNotification } from "@/chat/events/notification";
+import { createWatch, takeDueTimerWatches } from "@/chat/events/store";
 import { runTimerWatchHeartbeat } from "@/chat/events/timers";
 import { createEventTools } from "@/chat/tools/events";
 import {
@@ -16,6 +17,7 @@ import {
   passiveWatchMessageTexts,
 } from "../fixtures/conversation";
 import { context, execute } from "../fixtures/event-automations";
+import { spawnChildAgent } from "../fixtures/agent-invocations";
 
 // Timer heartbeat coverage lives here because heartbeat.test.ts is at its file limit.
 afterEach(async () => {
@@ -228,4 +230,134 @@ it("saves timers of a stopped root to its transcript until a person writes", asy
   await drain();
   expect(agentRuns).toHaveLength(3);
   expect(agentRuns[2]!.source).toMatchObject({ kind: "event" });
+});
+
+it("keeps watches passive when the stop drops queued input, but not a re-created watch", async () => {
+  const clock = vi.spyOn(Date, "now").mockReturnValue(1_800_000_000_000);
+  const fixture = await timerConversation();
+  const { conversationId, tools, queue, drain, agentRuns } = fixture;
+  await execute(
+    tools.watchTimer!,
+    { after_ms: 600_000, intent: "Check the deployment." },
+    "timer-1",
+  );
+  const deployWatch = () =>
+    createWatch({
+      conversationId,
+      events: ["deployment.succeeded"],
+      expiresAtMs: clock() + 3_600_000,
+      identifier: "prj_junior:production",
+      intent: "Report deploy results.",
+      label: "Vercel deployment junior-prod",
+      namespace: "vercel",
+      resourceType: "deployment",
+    });
+  await deployWatch();
+
+  // The stop drops a person's message that is still queued. That message
+  // does not make the watches active again.
+  await fixture.continue({
+    conversationId,
+    idempotencyKey: "before-stop",
+    message: "Are you there?",
+  });
+  clock.mockReturnValue(clock() + 1_000);
+  await expect(
+    stopConversation({ conversationId, queue }),
+  ).resolves.toMatchObject({ status: "requested" });
+  await drain();
+  expect(agentRuns).toHaveLength(0);
+  clock.mockReturnValue(clock() + 600_000);
+  await runTimerWatchHeartbeat({ nowMs: clock(), queue });
+  clock.mockReturnValue(clock() + 120_000);
+  await drain();
+  expect(agentRuns).toHaveLength(0);
+  expect(await passiveWatchMessageTexts(conversationId)).toEqual([
+    expect.stringContaining("Check the deployment."),
+  ]);
+
+  // Watching the same resource again creates an active watch.
+  const recreated = await deployWatch();
+  await enqueueEventNotification({
+    event: {
+      eventKey: "vercel:deploy-1:deployment.succeeded",
+      eventType: "deployment.succeeded",
+      identifier: recreated.identifier,
+      namespace: recreated.namespace,
+      occurredAtMs: clock(),
+      trustedSummary: "Deploy succeeded.",
+    },
+    queue,
+    subscription: recreated,
+  });
+  clock.mockReturnValue(clock() + 120_000);
+  await drain();
+  expect(agentRuns).toHaveLength(1);
+  expect(agentRuns[0]!.source).toMatchObject({ kind: "event" });
+});
+
+it("saves a stopped child's timers until a person writes to its root", async () => {
+  const clock = vi.spyOn(Date, "now").mockReturnValue(1_800_000_000_000);
+  // The root needs a Destination for its child, so start it with a message.
+  const fixture = await timerConversation();
+  const { agentRuns, conversationStore, drain, queue, state } = fixture;
+  const { conversationId } = await fixture.start({
+    idempotencyKey: "root-with-child",
+    message: "Start a child.",
+  });
+  await drain();
+  const child = await spawnChildAgent({
+    conversationStore,
+    idempotencyKey: "child-with-timers",
+    parentConversationId: conversationId,
+    queue,
+    state,
+  });
+  const childTools = createEventTools(
+    { ...context(), conversationId: child.childConversationId },
+    getEventCatalog(),
+  );
+  await execute(
+    childTools.watchTimer!,
+    { after_ms: 60_000, intent: "Check soon." },
+    "child-timer-1",
+  );
+  await execute(
+    childTools.watchTimer!,
+    { after_ms: 600_000, intent: "Check later." },
+    "child-timer-2",
+  );
+
+  // A person's stop of the root stops the child and makes its watches
+  // passive, so its timer is saved to its transcript and starts no Turn.
+  clock.mockReturnValue(clock() + 1_000);
+  await stopConversation({ conversationId, queue });
+  await drain();
+  clock.mockReturnValue(clock() + 120_000);
+  await runTimerWatchHeartbeat({ nowMs: clock(), queue });
+  clock.mockReturnValue(clock() + 120_000);
+  await drain();
+  expect(agentRuns).toHaveLength(1);
+  expect(await passiveWatchMessageTexts(child.childConversationId)).toEqual([
+    expect.stringContaining("Check soon."),
+  ]);
+
+  // A person's message to the root makes the child's watches active again,
+  // so its next timer starts the stopped child.
+  clock.mockReturnValue(clock() + 1_000);
+  await fixture.continue({
+    conversationId,
+    idempotencyKey: "after-root-stop",
+    message: "Keep going.",
+  });
+  await drain();
+  clock.mockReturnValue(clock() + 600_000);
+  await runTimerWatchHeartbeat({ nowMs: clock(), queue });
+  clock.mockReturnValue(clock() + 120_000);
+  await drain();
+  expect(
+    agentRuns
+      .filter((run) => run.conversationId === child.childConversationId)
+      .map((run) => run.source.kind),
+  ).toEqual(["event"]);
 });

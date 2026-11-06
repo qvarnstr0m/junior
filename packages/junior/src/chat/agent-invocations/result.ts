@@ -10,6 +10,7 @@ import {
   timerWatchCredentialSubject,
   type EventMailboxMetadata,
 } from "@/chat/events/notification";
+import { getWatch } from "@/chat/events/store";
 import {
   getEventBatchDelayMs,
   parseEventMessages,
@@ -337,6 +338,29 @@ async function getChildAgentInputInvocation(
 }
 
 /**
+ * Return whether no Watch of these Events ended. The session stop already
+ * dropped Events received before it and saved Events from passive Watches,
+ * so these come from Watches that a person made active again. A timer is
+ * `completed` once it fires, so only `cancelled` means a stop ended it.
+ */
+async function isFromLiveWatches(
+  messages: readonly InboundMessage[],
+  state: StateAdapter | undefined,
+): Promise<boolean> {
+  for (const message of messages) {
+    const metadata = message.input.metadata;
+    const watchId = isEventMailboxMetadata(metadata)
+      ? metadata.event.subscriptionId
+      : undefined;
+    const watch = watchId ? await getWatch({ id: watchId, state }) : undefined;
+    if (!watch || watch.status === "cancelled") {
+      return false;
+    }
+  }
+  return true;
+}
+
+/**
  * Give mailbox input that reaches a child Conversation to that child: results
  * and messages from its own child agents, and its own watch events. A child
  * Conversation has no Location, so it cannot run an Event Turn. Each input
@@ -363,11 +387,13 @@ async function startAgentInvocationsForChildInput(
   }
   // A stopped child takes no new work, even from input sent before the stop.
   // A tree stop leaves a `replaced` agent invocation with its finished status
-  // and marks it `skipped`, so that also means stopped.
+  // and marks it `skipped`, so that also means stopped. Events from Watches
+  // that a person made active again start work.
   if (
-    latest.status === "stopped" ||
-    (isTerminalAgentInvocation(latest) &&
-      latest.parentMailboxStatus === "skipped")
+    (latest.status === "stopped" ||
+      (isTerminalAgentInvocation(latest) &&
+        latest.parentMailboxStatus === "skipped")) &&
+    (isAgentInput || !(await isFromLiveWatches(messages, options.state)))
   ) {
     await context.attempt.ack();
     return { status: "completed" };

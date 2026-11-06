@@ -3,6 +3,7 @@ import type { StateAdapter } from "chat";
 import {
   getConversationStoppedAtMs,
   markConversationsStopped,
+  readConversationStop,
 } from "@/chat/conversations/session-stop";
 import { getSqlExecutor } from "@/chat/db";
 import {
@@ -25,8 +26,9 @@ import type { TerminalAgentInvocation } from "./types";
 /**
  * Stop one child agent of a parent Conversation and every child agent below
  * it. The parent gets no result. SQL stops the work first. Then each
- * Conversation in the tree ends its session, so its Watches become passive,
- * and a Conversation stop request aborts each run that is still working.
+ * Conversation in the tree ends its session. An agent stop is not a person
+ * stop, so their Watches end. A Conversation stop request aborts each run
+ * that is still working.
  *
  * Returns undefined when the child does not belong to the parent.
  */
@@ -49,24 +51,32 @@ export async function stopChildAgent(args: {
   if (!tree) {
     return undefined;
   }
-  await finishStoppedTree(tree, tree.conversationIds, args.state);
+  await finishStoppedTree(tree, tree.conversationIds, {
+    state: args.state,
+    watches: "cancel",
+  });
   return { stopped: tree.stopped.length > 0 || !wasStopped };
 }
 
 /**
  * Stop the child agents of an agent Conversation that a stop interrupted.
  * The worker of that Conversation calls this after it records its own stop,
- * so this sends no stop request to that Conversation.
+ * so this sends no stop request to that Conversation. Their Watches become
+ * passive when a person stopped it, and end when an agent stopped it.
  */
 export async function stopChildAgentsOf(
   conversationId: string,
   state?: StateAdapter,
 ): Promise<void> {
+  const stop = await readConversationStop(conversationId);
   const tree = await stopAgentInvocationTree(conversationId);
   await finishStoppedTree(
     tree,
     tree.conversationIds.filter((id) => id !== conversationId),
-    state,
+    {
+      state,
+      watches: stop?.watchesPassiveAtMs === undefined ? "cancel" : "passive",
+    },
   );
 }
 
@@ -92,7 +102,7 @@ export async function stopChildAgentsBelow(
   await finishStoppedTree(
     tree,
     tree.conversationIds.filter((id) => id !== conversationId),
-    state,
+    { nowMs, state, watches: "passive" },
   );
 }
 
@@ -139,14 +149,14 @@ async function skipUnreadResults(
 async function finishStoppedTree(
   tree: StoppedAgentTree,
   conversationIdsToStop: string[],
-  state: StateAdapter | undefined,
+  options: Parameters<typeof markConversationsStopped>[1],
 ): Promise<void> {
   for (const invocation of tree.stopped) {
     await recordSubagentEnded(invocation);
   }
-  await markConversationsStopped(conversationIdsToStop);
+  await markConversationsStopped(conversationIdsToStop, options);
   for (const conversationId of conversationIdsToStop) {
-    await stopConversationWork({ conversationId, state });
+    await stopConversationWork({ conversationId, state: options.state });
   }
 }
 
