@@ -2,6 +2,8 @@ import { eq } from "drizzle-orm";
 import { getChildAgentLabel } from "@/chat/agent-invocations/store";
 import { readAutomationTitlesByConversationId } from "@/chat/automations/execution-stats";
 import { getConversationStore, getDb } from "@/chat/db";
+import { conversationKindFromRow } from "@/chat/conversations/sql/conversation-row";
+import type { ConversationKind } from "@/chat/conversations/store";
 import { juniorConversations } from "@/db/schema";
 import type { ConversationAgentTreeNode } from "../schema/conversation";
 import type { ConversationAccessReader } from "./access";
@@ -12,14 +14,23 @@ import { conversationSummaryFromStoredConversation } from "./projection";
 const MAX_AGENT_TREE_DEPTH = 16;
 const CHILD_LABEL = "Subagent";
 
-async function readParentConversationId(
+async function readTreeNode(
   conversationId: string,
-): Promise<string | undefined> {
+): Promise<{ kind: ConversationKind; parentId?: string } | undefined> {
   const [row] = await getDb()
-    .select({ parentId: juniorConversations.parentConversationId })
+    .select({
+      kind: juniorConversations.kind,
+      parentConversationId: juniorConversations.parentConversationId,
+    })
     .from(juniorConversations)
     .where(eq(juniorConversations.conversationId, conversationId));
-  return row?.parentId ?? undefined;
+  if (!row) return undefined;
+  return {
+    kind: conversationKindFromRow(row),
+    ...(row.parentConversationId
+      ? { parentId: row.parentConversationId }
+      : undefined),
+  };
 }
 
 /**
@@ -32,17 +43,22 @@ export async function readConversationAgentTree(
   conversationId: string,
   readAccess: ConversationAccessReader,
 ): Promise<ConversationAgentTreeNode[] | undefined> {
-  // Read only parent ids. Every detail request calls this, and a root
-  // Conversation must not need a full Conversation record.
+  // Read only parent ids and kinds. Every detail request calls this, and a
+  // root Conversation must not need a full Conversation record.
   const ids = [conversationId];
-  let parentId = await readParentConversationId(conversationId);
+  const kindById = new Map<string, ConversationKind>();
+  let node = await readTreeNode(conversationId);
+  if (node) kindById.set(conversationId, node.kind);
+  let parentId = node?.parentId;
   while (
     parentId &&
     !ids.includes(parentId) &&
     ids.length < MAX_AGENT_TREE_DEPTH
   ) {
     ids.unshift(parentId);
-    parentId = await readParentConversationId(parentId);
+    node = await readTreeNode(parentId);
+    if (node) kindById.set(parentId, node.kind);
+    parentId = node?.parentId;
   }
   if (ids.length < 2) {
     return undefined;
@@ -73,14 +89,21 @@ export async function readConversationAgentTree(
           durationMs: 0,
           firstHumanMessageText: firstHumanMessageTextByConversation.get(id),
         });
-        return { conversationId: id, label: summary.displayTitle };
+        return {
+          conversationId: id,
+          kind: "root" as const,
+          label: summary.displayTitle,
+        };
       }
+      // The walk above read every id in the chain.
+      const kind = kindById.get(id) ?? "task";
       if (!itemAccess?.canViewPrivateContent) {
-        return { conversationId: id, label: CHILD_LABEL };
+        return { conversationId: id, kind, label: CHILD_LABEL };
       }
       const agent = await getChildAgentLabel(id);
       return {
         conversationId: id,
+        kind,
         label: agent?.title ?? agent?.agentName ?? CHILD_LABEL,
       };
     }),
