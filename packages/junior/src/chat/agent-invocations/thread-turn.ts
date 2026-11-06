@@ -20,21 +20,24 @@ import {
 } from "@/chat/task-execution/mailbox-turn";
 import { getTurnAuthorization } from "@/chat/task-execution/authorized-turn";
 import { getTurnRecord } from "@/chat/task-execution/checkpoint";
-import { requestConversationWork } from "@/chat/task-execution/store";
+import {
+  getConversationWorkState,
+  requestConversationWork,
+} from "@/chat/task-execution/store";
 import type { ConversationWorkerContext } from "@/chat/task-execution/worker";
 import {
   getActiveAgentInvocationForConversation,
   getAgentInvocationTurnId,
   getLatestAgentInvocationForConversation,
 } from "./store";
-import type { AgentInvocation } from "./types";
 import { readChildDepthAndRootLocation } from "./work";
 
 /**
  * Select the web Turn work of a Thread, or undefined for work that belongs to
- * an Agent invocation. One empty wake can be for either. A paused slice of
- * the open Agent invocation goes first, then a person's Turn that can resume.
- * Other empty wakes go to the open Agent invocation.
+ * an Agent invocation. One empty wake can be for either. The open Agent
+ * invocation takes it unless its slice waits for sign-in, because it may need
+ * the wake to start, continue, or recover from a lost worker. A person's Turn
+ * that can resume takes it otherwise.
  */
 export async function resolveThreadTurnWork(
   context: ConversationWorkerContext,
@@ -56,7 +59,10 @@ export async function resolveThreadTurnWork(
   if (
     !invocation ||
     ((await canResumePersonTurn(context.conversationId, turnId)) &&
-      !(await canResumeInvocationSlice(context.conversationId, invocation)))
+      (await isWaitingForSignIn(
+        context.conversationId,
+        getAgentInvocationTurnId(invocation.invocationId),
+      )))
   ) {
     return { kind: "resume", turnId };
   }
@@ -65,22 +71,36 @@ export async function resolveThreadTurnWork(
 
 /**
  * Ask for one more attempt after Agent invocation work when a person's Turn
- * can resume. Its wake can go to the Agent invocation, and nothing else
- * wakes it again.
+ * can resume and nothing else will wake it. Its wake can go to the Agent
+ * invocation. Queued input gets its own attempt, which asks again after it.
  */
 export async function requestPersonTurnAfterInvocation(
   context: ConversationWorkerContext,
   state?: StateAdapter,
 ): Promise<void> {
-  const [invocation, turnId] = await Promise.all([
+  const [invocation, turnId, work] = await Promise.all([
     getActiveAgentInvocationForConversation(context.conversationId),
     getActiveConversationTurnId(context.conversationId),
+    getConversationWorkState({
+      conversationId: context.conversationId,
+      state,
+    }),
   ]);
+  const handled = new Set(
+    context.attempt.messages.map((message) => message.inboundMessageId),
+  );
+  const queued = (work?.messages ?? []).some(
+    (message) => !handled.has(message.inboundMessageId),
+  );
   if (
     !turnId ||
+    queued ||
     !(await canResumePersonTurn(context.conversationId, turnId)) ||
     (invocation &&
-      (await canResumeInvocationSlice(context.conversationId, invocation)))
+      !(await isWaitingForSignIn(
+        context.conversationId,
+        getAgentInvocationTurnId(invocation.invocationId),
+      )))
   ) {
     return;
   }
@@ -103,15 +123,17 @@ async function canResumePersonTurn(
   return turn.resumeReason !== "auth" || !!(await getTurnAuthorization(turn));
 }
 
-async function canResumeInvocationSlice(
+/** Whether a Turn is paused for a sign-in that is not recorded yet. */
+async function isWaitingForSignIn(
   conversationId: string,
-  invocation: AgentInvocation,
+  turnId: string,
 ): Promise<boolean> {
-  const turn = await getTurnRecord(
-    conversationId,
-    getAgentInvocationTurnId(invocation.invocationId),
+  const turn = await getTurnRecord(conversationId, turnId);
+  return (
+    turn?.state === "paused" &&
+    turn.resumeReason === "auth" &&
+    !(await getTurnAuthorization(turn))
   );
-  return turn?.state === "paused" && turn.resumeReason !== "auth";
 }
 
 /** Run context of a person's Turn in a Thread. */

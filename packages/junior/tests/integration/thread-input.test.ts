@@ -7,6 +7,7 @@ import {
   completeAgentInvocation,
   createAgentInvocationForMessage,
   getActiveAgentInvocationForConversation,
+  getAgentInvocationTurnId,
   markAgentInvocationRunning,
 } from "@/chat/agent-invocations/store";
 import { createAndEnqueueAgentInvocation } from "@/chat/agent-invocations/work";
@@ -390,15 +391,14 @@ describe("Thread input", () => {
     }
   });
 
-  it("resumes a person's Turn when sign-in completes during an Agent invocation", async () => {
+  it("recovers a lost Agent invocation before a signed-in person's Turn", async () => {
     const harness = await createHarness();
     try {
       const threadId = await startThread(harness, "thread-spawn");
       await harness.process(threadId);
       await finishInvocation(harness, threadId);
       const personTurnId = await savePersonTurnPausedForSignIn(threadId);
-      // The parent's next Agent invocation runs elsewhere and has no paused
-      // slice for the wake.
+      // The parent's next Agent invocation lost its worker mid-Turn.
       const { invocation } = await createAgentInvocationForMessage({
         actor: slackInvocationInput.actor,
         childConversationId: threadId,
@@ -409,6 +409,16 @@ describe("Thread input", () => {
         parentToolCallId: "call-next",
       });
       await markAgentInvocationRunning(invocation.invocationId);
+      await saveTurnCheckpoint({
+        mode: "running",
+        conversationId: threadId,
+        turnId: getAgentInvocationTurnId(invocation.invocationId),
+        sliceId: 1,
+        messages: [],
+        destination: slackDestination,
+        source: { kind: "agent_invocation" },
+        surface: "internal",
+      });
       const runCount = harness.runs.length;
 
       // The sign-in callback records sign-in and sends one empty wake.
@@ -428,7 +438,19 @@ describe("Thread input", () => {
       });
       await harness.process(threadId);
 
-      const resumed = harness.runs.slice(runCount);
+      // The wake goes to the lost Agent invocation, which needs it to recover.
+      expect(harness.runs.slice(runCount)).toMatchObject([
+        { agentInvocationId: invocation.invocationId },
+      ]);
+
+      // Once the Agent invocation ends, the person's Turn resumes.
+      await completeAgentInvocation({
+        invocationId: invocation.invocationId,
+        result: "Checked it.",
+        status: "completed",
+      });
+      await harness.process(threadId);
+      const resumed = harness.runs.slice(runCount + 1);
       expect(resumed).toHaveLength(1);
       expect(resumed[0]).toMatchObject({
         actor: { platform: "web" },
