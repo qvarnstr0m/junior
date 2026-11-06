@@ -106,17 +106,17 @@ async function createHarness(streamForRun: (request: AgentRun) => StreamFn) {
       idempotencyKey: string;
       input: string;
     }) => {
-      const { invocation } = await createAgentInvocationForMessage({
+      const created = await createAgentInvocationForMessage({
         ...baseInput,
         ...args,
         parentToolCallId: args.idempotencyKey,
       });
-      await enqueueAgentInvocation(invocation, {
+      await enqueueAgentInvocation(created.invocation, {
         conversationStore,
         queue,
         state,
       });
-      return invocation;
+      return created;
     },
     queue,
     requests: (): AgentRun[] => run.mock.calls.map(([request]) => request),
@@ -183,7 +183,7 @@ describe("agent invocation identity and concurrency", () => {
         reasoningLevel: "high",
       });
       await harness.drainQueuedWork();
-      const second = await harness.message({
+      const { invocation: second } = await harness.message({
         childConversationId: first.childConversationId,
         idempotencyKey: "named-2",
         input: "second named task",
@@ -411,7 +411,7 @@ describe("agent invocation identity and concurrency", () => {
           idempotencyKey: "limit-busy-message",
           input: "more for the busy child",
         }),
-      ).resolves.toMatchObject({ status: "pending" });
+      ).resolves.toMatchObject({ queued: true });
 
       await harness.drainQueuedWork();
 
