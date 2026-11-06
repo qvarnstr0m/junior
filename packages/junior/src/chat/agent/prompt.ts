@@ -110,7 +110,7 @@ interface PromptReplayArgs {
  */
 function renderThreadContextForPrompt(context: string): string {
   if (
-    /^<(?:thread-context|thread-compactions|thread-transcript|thread-background|recent-thread-messages|root-conversation)(?:\s|>)/.test(
+    /^<(?:thread-context|thread-compactions|thread-transcript|thread-background|recent-thread-messages)(?:\s|>)/.test(
       context,
     )
   ) {

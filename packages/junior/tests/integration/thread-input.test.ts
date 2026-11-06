@@ -6,6 +6,7 @@ import { bindMessageAgent } from "@/chat/agent-invocations/message";
 import {
   completeAgentInvocation,
   createAgentInvocationForMessage,
+  getAgentInvocation,
   getActiveAgentInvocationForConversation,
   getAgentInvocationTurnId,
   markAgentInvocationRunning,
@@ -20,8 +21,10 @@ import {
   WebMessageRefusedError,
   webActorFromUser,
 } from "@/chat/conversations/web-input";
+import { openConversationProjection } from "@/chat/conversations/projection";
 import { getConversationEventStore, getDb } from "@/chat/db";
 import { resolveViewerUser } from "@/chat/plugins/viewer";
+import { AuthorizationFlowDisabledError } from "@/chat/services/auth-pause";
 import {
   getLocationConfigurationService,
   persistThreadStateById,
@@ -53,21 +56,40 @@ async function createHarness() {
   const { conversationStore, fixture } = await prepareSlackParentConversation();
   // Integration tests do not run the agent. The runner checks each run as
   // the agent does first, reads it, and stops it. The test finishes each
-  // Agent invocation itself.
+  // Agent invocation itself, or makes its runs fail with `invocationError`.
   const runs: AgentRun[] = [];
+  let invocationError: Error | undefined;
   const work = await createConversationWorkHarness({
     run: async (run) => {
       await checkRunConsistency(run);
       runs.push(run);
+      if (run.agentInvocationId && invocationError) {
+        throw invocationError;
+      }
       throw new Error("stop after reading the run");
     },
   });
+  /** Run the next queued wake of one Conversation. */
+  const process = async (conversationId: string) =>
+    await work.process(work.queue.takeMessageFor(conversationId));
   return {
     close: async () => await fixture.close(),
     conversationStore,
-    /** Run the next queued wake of one Conversation. */
-    process: async (conversationId: string) =>
-      await work.process(work.queue.takeMessageFor(conversationId)),
+    /** Run every queued wake of one Conversation, as the queue does. */
+    drain: async (conversationId: string) => {
+      while (
+        work.queue
+          .queuedMessages()
+          .some((message) => message.conversationId === conversationId)
+      ) {
+        await process(conversationId);
+      }
+    },
+    /** Make each later Agent invocation run fail with this error. */
+    failInvocationsWith: (error: Error) => {
+      invocationError = error;
+    },
+    process,
     queue: work.queue,
     runs,
     state: work.state,
@@ -213,6 +235,79 @@ async function savePersonTurnPausedForSignIn(threadId: string) {
   return turnId;
 }
 
+/**
+ * Save the slice that a parent's Agent invocation leaves after it took its
+ * input: `running` when its worker died, `paused` when it yielded.
+ */
+async function saveInvocationSlice(
+  threadId: string,
+  mode: "paused" | "running",
+): Promise<string> {
+  const { invocation } = await createAgentInvocationForMessage({
+    actor: slackInvocationInput.actor,
+    childConversationId: threadId,
+    destination: slackDestination,
+    idempotencyKey: "thread-next",
+    input: "Also check the retry path.",
+    parentConversationId: slackParentConversationId,
+    parentToolCallId: "call-next",
+  });
+  await markAgentInvocationRunning(invocation.invocationId);
+  const history = (
+    await openConversationProjection({ conversationId: threadId })
+  ).messages;
+  const slice = {
+    actor: slackInvocationInput.actor,
+    conversationId: threadId,
+    destination: slackDestination,
+    messages: [
+      ...history,
+      {
+        role: "user" as const,
+        content: [
+          { type: "text" as const, text: "Also check the retry path." },
+        ],
+        timestamp: Date.now(),
+      },
+    ],
+    sliceId: 1,
+    source: { kind: "agent_invocation" as const },
+    surface: "internal" as const,
+    turnId: getAgentInvocationTurnId(invocation.invocationId),
+  };
+  await saveTurnCheckpoint(
+    mode === "paused"
+      ? { ...slice, mode, reason: "yield" }
+      : { ...slice, mode },
+  );
+  await expect(getTurnRecord(threadId, slice.turnId)).resolves.toMatchObject({
+    state: mode,
+  });
+  return invocation.invocationId;
+}
+
+/** Record the person's sign-in and send its one empty wake. */
+async function signInAndWake(
+  harness: Harness,
+  threadId: string,
+  turnId: string,
+) {
+  const request = await recordTurnAuthorization({
+    actorId: "U123",
+    authorizationId: "authorization-1",
+    conversationId: threadId,
+    destination: slackDestination,
+    kind: "plugin",
+    provider: "github",
+    turnId,
+  });
+  await wakePausedTurn(request!, {
+    conversationStore: harness.conversationStore,
+    queue: harness.queue,
+    state: harness.state,
+  });
+}
+
 describe("Thread input", () => {
   afterEach(async () => {
     await disconnectStateAdapter();
@@ -261,7 +356,9 @@ describe("Thread input", () => {
         destination: slackDestination,
         disabledFeatures: ["subagents"],
         instruction: {
-          context: expect.stringContaining("<root-conversation>"),
+          context: expect.stringContaining(
+            '<root-conversation source="junior">',
+          ),
           includeConversationContextWithHistory: true,
         },
       });
@@ -398,65 +495,67 @@ describe("Thread input", () => {
       await harness.process(threadId);
       await finishInvocation(harness, threadId);
       const personTurnId = await savePersonTurnPausedForSignIn(threadId);
-      // The parent's next Agent invocation lost its worker mid-Turn.
-      const { invocation } = await createAgentInvocationForMessage({
-        actor: slackInvocationInput.actor,
-        childConversationId: threadId,
-        destination: slackDestination,
-        idempotencyKey: "thread-next",
-        input: "Also check the retry path.",
-        parentConversationId: slackParentConversationId,
-        parentToolCallId: "call-next",
-      });
-      await markAgentInvocationRunning(invocation.invocationId);
-      await saveTurnCheckpoint({
-        mode: "running",
-        conversationId: threadId,
-        turnId: getAgentInvocationTurnId(invocation.invocationId),
-        sliceId: 1,
-        messages: [],
-        destination: slackDestination,
-        source: { kind: "agent_invocation" },
-        surface: "internal",
-      });
+      // The parent's next Agent invocation took its input, then its worker
+      // died mid-Turn. Only the heartbeat's empty wake can recover it.
+      const invocationId = await saveInvocationSlice(threadId, "running");
+      await signInAndWake(harness, threadId, personTurnId);
       const runCount = harness.runs.length;
+      await harness.drain(threadId);
 
-      // The sign-in callback records sign-in and sends one empty wake.
-      const request = await recordTurnAuthorization({
-        actorId: "U123",
-        authorizationId: "authorization-1",
-        conversationId: threadId,
-        destination: slackDestination,
-        kind: "plugin",
-        provider: "github",
-        turnId: personTurnId,
+      // The wake ends the lost Agent invocation and reports it to the
+      // parent. Then the person's Turn resumes.
+      await expect(getAgentInvocation(invocationId)).resolves.toMatchObject({
+        errorMessage: "Agent invocation lost its worker before it could pause",
+        status: "failed",
       });
-      await wakePausedTurn(request!, {
-        conversationStore: harness.conversationStore,
-        queue: harness.queue,
-        state: harness.state,
-      });
-      await harness.process(threadId);
-
-      // The wake goes to the lost Agent invocation, which needs it to recover.
-      expect(harness.runs.slice(runCount)).toMatchObject([
-        { agentInvocationId: invocation.invocationId },
-      ]);
-
-      // Once the Agent invocation ends, the person's Turn resumes.
-      await completeAgentInvocation({
-        invocationId: invocation.invocationId,
-        result: "Checked it.",
-        status: "completed",
-      });
-      await harness.process(threadId);
-      const resumed = harness.runs.slice(runCount + 1);
-      expect(resumed).toHaveLength(1);
-      expect(resumed[0]).toMatchObject({
+      expect(
+        (
+          await getConversationWorkState({
+            conversationId: slackParentConversationId,
+            state: harness.state,
+          })
+        )?.messages.map((message) => message.input.metadata?.event),
+      ).toContainEqual(
+        expect.objectContaining({
+          eventType: "agent_invocation.failed",
+          identifier: invocationId,
+        }),
+      );
+      expect(harness.runs[runCount]).toMatchObject({
         actor: { platform: "web" },
         turnId: personTurnId,
       });
-      expect(resumed[0]?.agentInvocationId).toBeUndefined();
+    } finally {
+      await harness.close();
+    }
+  });
+
+  it("resumes a signed-in person's Turn after the Agent invocation ends", async () => {
+    const harness = await createHarness();
+    try {
+      const threadId = await startThread(harness, "thread-spawn");
+      await harness.process(threadId);
+      await finishInvocation(harness, threadId);
+      const personTurnId = await savePersonTurnPausedForSignIn(threadId);
+      // The parent's next Agent invocation yielded between slices. It takes
+      // the sign-in wake and ends blocked.
+      const invocationId = await saveInvocationSlice(threadId, "paused");
+      harness.failInvocationsWith(
+        new AuthorizationFlowDisabledError("plugin", "github"),
+      );
+      await signInAndWake(harness, threadId, personTurnId);
+      const runCount = harness.runs.length;
+      await harness.drain(threadId);
+
+      await expect(getAgentInvocation(invocationId)).resolves.toMatchObject({
+        status: "blocked",
+      });
+      // The person's Turn gets its own attempt after the Agent invocation.
+      // The fake runner stops it, so its later runs are retries.
+      expect(harness.runs.slice(runCount, runCount + 2)).toMatchObject([
+        { agentInvocationId: invocationId },
+        { actor: { platform: "web" }, turnId: personTurnId },
+      ]);
     } finally {
       await harness.close();
     }

@@ -11,13 +11,10 @@ import {
   agentInstructionProvenance,
   sameActorIdentity,
 } from "@/chat/conversations/provenance";
-import type {
-  Conversation,
-  ConversationStore,
-} from "@/chat/conversations/store";
+import type { ConversationStore } from "@/chat/conversations/store";
 import { openConversationProjection } from "@/chat/conversations/projection";
 import { ConversationTurnLifecycleService } from "@/chat/conversations/turn-lifecycle";
-import { getConversationEventStore, getConversationStore } from "@/chat/db";
+import { getConversationEventStore } from "@/chat/db";
 import { SYSTEM_IDENTITY_ID } from "@/chat/identities/actor";
 import type { AgentRunner } from "@/chat/runtime/agent-runner";
 import {
@@ -55,6 +52,7 @@ import { getAssistantReplyText } from "@/chat/services/assistant-reply";
 import { getTerminalAssistantMessages } from "@/chat/pi/transcript";
 import type { PiMessage } from "@/chat/pi/messages";
 import type { SandboxRef } from "@/chat/sandbox/ref";
+import { readChildDepthAndRootLocation } from "./lineage";
 import {
   agentTypeInstructions,
   agentTypeStartsWithParentHistory,
@@ -625,25 +623,6 @@ async function saveAgentInvocationResult(args: {
     );
   }
   return agentInvocationTurnEnd(terminal);
-}
-
-/**
- * Read how many parents a child Conversation has, and the root Conversation
- * with its Location. A child of the root has depth 1.
- */
-export async function readChildDepthAndRootLocation(
-  conversationId: string,
-): Promise<{ depth: number; location?: Location; root?: Conversation }> {
-  const conversationStore = getConversationStore();
-  let depth = 0;
-  let conversation = await conversationStore.get({ conversationId });
-  while (conversation?.parentConversationId) {
-    depth += 1;
-    conversation = await conversationStore.get({
-      conversationId: conversation.parentConversationId,
-    });
-  }
-  return { depth, location: conversation?.location, root: conversation };
 }
 
 /**

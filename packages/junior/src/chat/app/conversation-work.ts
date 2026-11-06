@@ -194,7 +194,7 @@ export function createConversationWork(
       conversationId: context.conversationId,
     });
     if (conversation?.kind === "thread") {
-      const threadTurn = await resolveThreadTurnWork(context);
+      const threadTurn = await resolveThreadTurnWork(context, options.state);
       if (threadTurn) {
         return await conversationTurnWorker(context, threadTurn);
       }

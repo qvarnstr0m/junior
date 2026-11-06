@@ -1,4 +1,4 @@
-import { readChildDepthAndRootLocation } from "@/chat/agent-invocations/work";
+import { readChildDepthAndRootLocation } from "@/chat/agent-invocations/lineage";
 import { getConversationStore } from "@/chat/db";
 import { assertRunConsistency, type AgentRun } from "./types";
 
@@ -13,6 +13,7 @@ async function readThreadRootConversationId(
 ): Promise<string | undefined> {
   if (
     run.source.kind !== "web" ||
+    run.source.conversationId !== run.conversationId ||
     run.destination.platform !== "local" ||
     run.destination.conversationId === run.source.conversationId
   ) {
