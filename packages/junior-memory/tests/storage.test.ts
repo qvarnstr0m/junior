@@ -90,6 +90,10 @@ function memoryHeartbeatContext(args: {
     nowMs: args.nowMs,
     plugin: { name: "memory" },
     state: memoryState,
+    users: {
+      directDestination: vi.fn(),
+      findByEmail: vi.fn(),
+    },
   };
 }
 

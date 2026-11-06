@@ -1,5 +1,11 @@
 import * as z from "zod";
-import type { Identity, PluginContext, PluginEmbedder, User } from "./context";
+import type {
+  Identity,
+  PluginContext,
+  PluginEmbedder,
+  SlackDestination,
+  User,
+} from "./context";
 import type { Dispatch, DispatchOptions, DispatchResult } from "./dispatch";
 import { nonBlankStringSchema } from "./schemas";
 import type { PluginReadState, PluginState } from "./state";
@@ -21,6 +27,18 @@ export interface HeartbeatHookContext extends PluginContext {
   embedder: PluginEmbedder;
   nowMs: number;
   state: PluginState;
+  users: {
+    /**
+     * Read the existing User whose primary email matches. Never creates a
+     * User. The plugin must verify that the email is authentic first.
+     */
+    findByEmail(email: string): Promise<User | undefined>;
+    /**
+     * Open Junior's private direct message with one User. Return undefined
+     * when the User has no Slack Identity.
+     */
+    directDestination(userId: string): Promise<SlackDestination | undefined>;
+  };
 }
 
 export interface HeartbeatResult {

@@ -12,6 +12,8 @@ import { getDb } from "@/chat/db";
 import { createPluginLogger } from "@/chat/plugins/logging";
 import { createPluginEmbedder } from "@/chat/plugins/model";
 import { createPluginState } from "@/chat/plugins/state";
+import { findUserByEmail } from "@/chat/plugins/viewer";
+import { openUserDirectDestination } from "@/chat/slack/user-direct-destination";
 import type { ConversationWorkQueue } from "@/chat/task-execution/queue";
 import {
   buildDispatchId,
@@ -104,6 +106,12 @@ export function createHeartbeatContext(args: {
     embedder: createPluginEmbedder(pluginName),
     state: createPluginState(pluginName),
     log: createPluginLogger(pluginName),
+    users: {
+      findByEmail: findUserByEmail,
+      async directDestination(userId) {
+        return await openUserDirectDestination(getDb(), userId);
+      },
+    },
     agent: {
       async dispatch(options) {
         validateDispatchOptions(options);

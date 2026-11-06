@@ -14,6 +14,8 @@ import type { PiMessage } from "@/chat/pi/messages";
 import { setPlugins } from "@/chat/plugins/agent-hooks";
 import { GET as heartbeat } from "@/handlers/heartbeat";
 import { createSlackDirectCredentialSubject } from "@/chat/credentials/subject";
+import { getSqlExecutor } from "@/chat/db";
+import { resolveActorIdentityId } from "@/chat/identities/actor";
 import { createConversationWorkQueueTestAdapter } from "../fixtures/conversation-work";
 import { createWaitUntilCollector } from "../fixtures/wait-until";
 import { getCapturedSlackApiCalls } from "../msw/handlers/slack-api";
@@ -391,6 +393,42 @@ describe("plugin heartbeat", () => {
       metadata: { runId: "run-1" },
       source: { kind: "plugin_dispatch" },
     });
+  });
+
+  it("finds a known User by email and opens their direct message", async () => {
+    // Slack ingress links the Identity to the User of its profile email.
+    await resolveActorIdentityId(getSqlExecutor(), {
+      platform: "slack",
+      teamId: "T123",
+      userId: "UMAYA",
+      email: "maya@example.com",
+    });
+    const ctx = createTestHeartbeatContext({
+      plugin: "google",
+      nowMs: TEST_NOW_MS,
+    });
+
+    const user = await ctx.users.findByEmail("Maya@Example.com");
+    expect(user?.identities).toContainEqual(
+      expect.objectContaining({
+        provider: "slack",
+        providerSubjectId: "UMAYA",
+      }),
+    );
+    // A lookup never creates a User.
+    await expect(
+      ctx.users.findByEmail("nobody@example.com"),
+    ).resolves.toBeUndefined();
+    await expect(ctx.users.directDestination(user!.id)).resolves.toEqual({
+      platform: "slack",
+      teamId: "T123",
+      channelId: "D0TEST",
+    });
+    expect(
+      getCapturedSlackApiCalls("conversations.open").map(
+        ({ params }) => params.users,
+      ),
+    ).toEqual(["UMAYA"]);
   });
 
   it("keeps plugin state isolated when plugin names and keys contain delimiters", async () => {
