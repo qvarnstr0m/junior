@@ -72,6 +72,9 @@ export const juniorConversations = pgTable(
     // TODO(dcramer): After every deployed writer sets kind, rerun the
     // `kind IS NULL` backfill, then add NOT NULL and a check constraint.
     kind: text("kind").$type<ConversationKind>(),
+    // Set only on Threads. A Thread is shared work, so its archive applies to
+    // everyone. Roots keep their per-viewer archive on participant rows.
+    threadArchivedAt: timestamptz("thread_archived_at"),
     // Forks are independent roots. This edge supports source/fork lookup and
     // does not affect root ownership or child conversation traversal.
     forkedFromConversationId: text("forked_from_conversation_id").references(

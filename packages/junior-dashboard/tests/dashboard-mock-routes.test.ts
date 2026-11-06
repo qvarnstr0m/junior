@@ -6,6 +6,7 @@ import {
   conversationDetailReportSchema,
   conversationUnchangedDetailWithMailboxSchema,
   conversationEventPageSchema,
+  conversationFeedSchema,
   type ConversationSummaryReport,
 } from "@sentry/junior/api/schema";
 
@@ -13,8 +14,11 @@ import { createDashboardApp } from "../src/app";
 import {
   ARCHIVED_CONVERSATION_ID,
   conversationTimeBounds,
+  DASHBOARD_QA_ARCHIVED_THREAD_ID,
   DASHBOARD_QA_CONVERSATION_ID,
+  DASHBOARD_QA_THREAD_ID,
   NOW,
+  resetMockConversationViewerState,
   setMockConversationArchived,
 } from "../src/mock-reporting/fixtures";
 
@@ -35,6 +39,7 @@ describe("dashboard canonical-event mock routes", () => {
       startedAt: string,
       lastSeenAt: string,
     ): ConversationSummaryReport => ({
+      kind: "root",
       channel: "CQA123",
       channelName: "proj-checkout",
       conversationId,
@@ -408,6 +413,67 @@ describe("dashboard canonical-event mock routes", () => {
     expect(limitedHistory.events.at(-1)!.seq).toBeLessThan(
       limitedDetail.events[0]!.seq,
     );
+  });
+
+  it("nests shown Threads under their root and archives them for everyone", async () => {
+    const app = createDashboardApp({
+      authRequired: false,
+      allowedDomains: [],
+      mockConversations: true,
+    });
+    const qaThreads = async () =>
+      conversationFeedSchema
+        .parse(
+          await (
+            await app.fetch(new Request("http://localhost/api/conversations"))
+          ).json(),
+        )
+        .conversations.find(
+          (item) => item.conversationId === DASHBOARD_QA_CONVERSATION_ID,
+        )
+        ?.threads?.map((thread) => thread.conversationId);
+    const archiveThread = (conversationId: string, archived: boolean) =>
+      app.fetch(
+        new Request(
+          `http://localhost/api/conversations/${encodeURIComponent(conversationId)}/archive`,
+          {
+            body: JSON.stringify({ archived, lastSeenAt: NOW }),
+            headers: { "content-type": "application/json" },
+            method: "PATCH",
+          },
+        ),
+      );
+
+    try {
+      await expect(qaThreads()).resolves.toEqual([DASHBOARD_QA_THREAD_ID]);
+      const archivedThread = conversationDetailReportSchema.parse(
+        await (
+          await app.fetch(
+            new Request(
+              `http://localhost/api/conversations/${encodeURIComponent(DASHBOARD_QA_ARCHIVED_THREAD_ID)}`,
+            ),
+          )
+        ).json(),
+      );
+      expect(archivedThread).toMatchObject({
+        kind: "thread",
+        parentConversationId: DASHBOARD_QA_CONVERSATION_ID,
+        threadArchivedAt: expect.any(String),
+      });
+
+      expect((await archiveThread(DASHBOARD_QA_THREAD_ID, true)).status).toBe(
+        200,
+      );
+      await expect(qaThreads()).resolves.toBeUndefined();
+      expect(
+        (await archiveThread(DASHBOARD_QA_ARCHIVED_THREAD_ID, false)).status,
+      ).toBe(200);
+      await expect(qaThreads()).resolves.toEqual([
+        DASHBOARD_QA_ARCHIVED_THREAD_ID,
+      ]);
+    } finally {
+      resetMockConversationViewerState();
+    }
   });
 
   it("loads canonical child conversations through the ordinary detail route", async () => {

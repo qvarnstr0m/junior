@@ -133,6 +133,9 @@ const DASHBOARD_QA_PLAN_ID = "junior:internal:dashboard-qa:advisor-plan";
 const DASHBOARD_QA_REVIEW_ID = "junior:internal:dashboard-qa:advisor-review";
 const DASHBOARD_QA_PLAN_CHECK_ID =
   "junior:internal:dashboard-qa:advisor-plan:claim-check";
+export const DASHBOARD_QA_THREAD_ID = "junior:internal:dashboard-qa:thread";
+export const DASHBOARD_QA_ARCHIVED_THREAD_ID =
+  "junior:internal:dashboard-qa:archived-thread";
 /** Process-local archive state so mock restore can be exercised in visual QA. */
 const mockArchivedConversationIds = new Set<string>([ARCHIVED_CONVERSATION_ID]);
 /** Process-local pins so the Pinned section can be exercised in visual QA. */
@@ -143,9 +146,15 @@ const mockPinPositions = new Map<string, number>();
 /** Process-local auto-archive choices for mock visual QA. */
 const mockAutoArchiveByConversationId = new Map<string, boolean>();
 
+/** Process-local Thread archives. A Thread archive applies to everyone. */
+const initialMockThreadArchives: [string, string][] = [
+  [DASHBOARD_QA_ARCHIVED_THREAD_ID, iso(NOW_MS, -2 * 60 * 60_000)],
+];
+const mockThreadArchivedAt = new Map(initialMockThreadArchives);
+
 /**
- * Restore process-local archive, pin, and auto-archive state so tests sharing
- * a worker do not leak state.
+ * Restore process-local archive, pin, auto-archive, and Thread archive state
+ * so tests sharing a worker do not leak state.
  */
 export function resetMockConversationViewerState(): void {
   mockArchivedConversationIds.clear();
@@ -153,6 +162,10 @@ export function resetMockConversationViewerState(): void {
   mockPinnedConversationIds.clear();
   mockPinPositions.clear();
   mockAutoArchiveByConversationId.clear();
+  mockThreadArchivedAt.clear();
+  for (const [id, at] of initialMockThreadArchives) {
+    mockThreadArchivedAt.set(id, at);
+  }
 }
 
 /** Add the viewer's mock archive and pin times to one conversation. */
@@ -214,6 +227,7 @@ type DetailOptions = Omit<
   | "events"
   | "generatedAt"
   | "isParticipant"
+  | "kind"
   | "lastProgressAt"
   | "lastSeenAt"
   | "startedAt"
@@ -225,6 +239,7 @@ type DetailOptions = Omit<
   eventHistory?: ConversationDetailReport["eventHistory"];
   events: ConversationReportEvent[];
   isParticipant?: boolean;
+  kind?: ConversationDetailReport["kind"];
   lastProgressAt?: string;
   lastSeenAt?: string;
   startedAt: string;
@@ -232,9 +247,7 @@ type DetailOptions = Omit<
   surface?: ConversationDetailReport["surface"];
 };
 
-type MockConversation = ConversationDetailReport & {
-  parentConversationId?: string;
-};
+type MockConversation = ConversationDetailReport;
 
 function detail(
   nowMs: number,
@@ -246,6 +259,7 @@ function detail(
     eventHistory: options.eventHistory ?? { status: "available" },
     generatedAt: iso(nowMs),
     isParticipant: options.isParticipant ?? false,
+    kind: options.kind ?? "root",
     lastProgressAt: options.lastProgressAt ?? options.startedAt,
     lastSeenAt: options.lastSeenAt ?? options.startedAt,
     status: options.status ?? "completed",
@@ -1088,7 +1102,44 @@ function advisorConversation(
       }),
     ],
   });
-  return { ...conversation, parentConversationId };
+  return { ...conversation, kind: "task", parentConversationId };
+}
+
+/** A Thread under the dashboard QA root. Its messages come from a person. */
+function threadConversation(
+  nowMs: number,
+  conversationId: string,
+  displayTitle: string,
+  text: string,
+  offsetMs: number,
+): MockConversation {
+  const startedAt = iso(nowMs, offsetMs);
+  return detail(nowMs, {
+    conversationId,
+    displayTitle,
+    kind: "thread",
+    parentConversationId: DASHBOARD_QA_CONVERSATION_ID,
+    threadArchivedAt: mockThreadArchivedAt.get(conversationId) ?? null,
+    actorIdentity: actor("dev@example.com", "Morgan Lee", "morgan"),
+    startedAt,
+    lastSeenAt: iso(Date.parse(startedAt), 12_000),
+    lastProgressAt: iso(Date.parse(startedAt), 12_000),
+    cumulativeDurationMs: 12_000,
+    events: [
+      reportEvent(0, startedAt, {
+        type: "message",
+        messageId: `${conversationId}:input`,
+        role: "user",
+        text,
+      }),
+      reportEvent(1, iso(Date.parse(startedAt), 12_000), {
+        type: "message",
+        messageId: `${conversationId}:output`,
+        role: "assistant",
+        text: "Done. No differences found.",
+      }),
+    ],
+  });
 }
 
 function longConversation(nowMs: number): ConversationDetailReport {
@@ -1620,6 +1671,20 @@ function mockConversations(nowMs: number): MockConversation[] {
         },
       },
     ),
+    threadConversation(
+      nowMs,
+      DASHBOARD_QA_THREAD_ID,
+      "Check pinned row order",
+      "Check that pinned rows keep their order after a reload.",
+      -3 * 60 * 60_000,
+    ),
+    threadConversation(
+      nowMs,
+      DASHBOARD_QA_ARCHIVED_THREAD_ID,
+      "Compare sidebar badges",
+      "Compare the sidebar badges with the design.",
+      -3.5 * 60 * 60_000,
+    ),
     longConversation(nowMs),
     incidentConversation(nowMs),
     privateConversation(nowMs),
@@ -1684,7 +1749,6 @@ function summaryFromConversation(
     events: _events,
     generatedAt: _generatedAt,
     modelUsage: _modelUsage,
-    parentConversationId: _parentConversationId,
     previousCursor: _previousCursor,
     sentryConversationUrl: _sentryConversationUrl,
     sourceTask: _sourceTask,
@@ -1701,21 +1765,39 @@ function summaryFromConversation(
     : withViewerState;
 }
 
+/**
+ * Match the API feed: roots only, each with its shown Threads nested under
+ * it. Mock Threads sit directly under their root.
+ */
 function mockConversationFeed(nowMs: number): ConversationFeed {
+  const conversations = mockConversations(nowMs);
   return {
     source: "conversation_index",
     generatedAt: iso(nowMs),
-    conversations: mockConversations(nowMs)
-      .filter((conversation) => !conversation.parentConversationId)
-      .map(summaryFromConversation),
+    conversations: conversations
+      .filter((conversation) => conversation.kind === "root")
+      .map((root) => {
+        const summary = summaryFromConversation(root);
+        if (summary.archivedAt) return summary;
+        const threads = conversations
+          .filter(
+            (conversation) =>
+              conversation.kind === "thread" &&
+              conversation.parentConversationId === root.conversationId &&
+              !conversation.threadArchivedAt,
+          )
+          .map(summaryFromConversation);
+        return threads.length ? { ...summary, threads } : summary;
+      }),
   };
 }
 
 /** Active root summaries used by mock aggregates and directories. */
 function activeMockSummaries(nowMs: number): ConversationSummaryReport[] {
-  return mockConversationFeed(nowMs).conversations.filter(
-    (summary) => !summary.archivedAt,
-  );
+  return mockConversations(nowMs)
+    .filter((conversation) => conversation.kind === "root")
+    .map(summaryFromConversation)
+    .filter((summary) => !summary.archivedAt);
 }
 
 function summaryTokenTotal(summary: ConversationSummaryReport): number {
@@ -1949,10 +2031,15 @@ export function setMockConversationArchived(
   conversationId: string,
   archived: boolean,
 ): { archivedAt: string | null } | undefined {
-  const exists = mockConversations(NOW_MS).some(
-    (conversation) => conversation.conversationId === conversationId,
+  const conversation = mockConversations(NOW_MS).find(
+    (candidate) => candidate.conversationId === conversationId,
   );
-  if (!exists) return undefined;
+  if (!conversation) return undefined;
+  if (conversation.kind === "thread") {
+    if (archived) mockThreadArchivedAt.set(conversationId, NOW);
+    else mockThreadArchivedAt.delete(conversationId);
+    return { archivedAt: mockThreadArchivedAt.get(conversationId) ?? null };
+  }
   if (archived) {
     mockArchivedConversationIds.add(conversationId);
     // Match the API: archive also unpins.
@@ -2245,16 +2332,15 @@ export function readMockConversationDetail(
     (candidate) => candidate.conversationId === conversationId,
   );
   if (!conversation) return undefined;
-  const { parentConversationId, ...conversationDetail } = conversation;
   const agentTree = mockAgentTree(conversation);
   // Match the API: only readable root Conversations can be forked.
   const detail = {
-    ...conversationDetail,
+    ...conversation,
     ...(agentTree ? { agentTree } : undefined),
     canFork:
-      !parentConversationId &&
-      conversationDetail.eventHistory.status !== "redacted",
-    ...(conversationDetail.isParticipant
+      !conversation.parentConversationId &&
+      conversation.eventHistory.status !== "redacted",
+    ...(conversation.isParticipant
       ? {
           autoArchive:
             mockAutoArchiveByConversationId.get(conversationId) ?? false,
