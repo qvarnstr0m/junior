@@ -36,6 +36,7 @@ import type { ConversationWorkQueue } from "@/chat/task-execution/queue";
 import {
   appendAndEnqueueInboundMessage,
   getConversationWorkState,
+  type StopConversationWorkResult,
 } from "@/chat/task-execution/store";
 import { withLock } from "@/chat/state/locks";
 import {
@@ -428,19 +429,24 @@ async function handleSlackSessionStop(args: {
     conversationStore: args.conversationStore,
     installation: args.installation,
   });
-  // Stop the child agents first, so a failure leaves the Turn running. A
-  // child agent can outlive the parent Turn, so this runs even with no Turn.
-  await stopChildAgentsBelow(conversationId, args.state);
-  const stopped = await stopConversationTurn({
-    conversationId,
-    conversationStore: args.conversationStore,
-    queue: args.queue,
-    state: args.state,
-  });
-  await createSlackWebApiStatusSender({
-    channelId: args.channelId,
-    threadTs: args.threadTs,
-  })("");
+  let stopped: StopConversationWorkResult;
+  try {
+    // Stop the child agents first, so a failure leaves the Turn running. A
+    // child agent can outlive the parent Turn, so this runs even with no Turn.
+    await stopChildAgentsBelow(conversationId, args.state);
+    stopped = await stopConversationTurn({
+      conversationId,
+      conversationStore: args.conversationStore,
+      queue: args.queue,
+      state: args.state,
+    });
+  } finally {
+    // The person pressed stop, so Slack stops showing the status either way.
+    await createSlackWebApiStatusSender({
+      channelId: args.channelId,
+      threadTs: args.threadTs,
+    })("");
+  }
   if (stopped.status !== "requested") {
     return;
   }

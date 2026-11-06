@@ -3,10 +3,12 @@ import { afterEach, describe, expect, it } from "vitest";
 import { createJuniorApi, type JuniorApiVariables } from "@/api";
 import { createAcpConversations } from "@/api/acp/conversations";
 import { enqueueAgentInvocationResult } from "@/chat/agent-invocations/result";
+import { listChildAgents } from "@/chat/agent-invocations/list";
 import {
   completeAgentInvocation,
   createAgentInvocation,
   getAgentInvocation,
+  getAgentInvocationResultMessageId,
 } from "@/chat/agent-invocations/store";
 import type { TerminalAgentInvocation } from "@/chat/agent-invocations/types";
 import { stopConversationTurnResponseSchema } from "@/api/schema";
@@ -184,6 +186,27 @@ describe("conversation stop API", () => {
       fixture,
       "stop-idle-root",
     );
+    // The parent Turn already read the result of this child.
+    const done = await spawnChildAgent({
+      conversationStore,
+      idempotencyKey: "stop-idle-done-child",
+      parentConversationId: created.conversationId,
+      queue,
+      state,
+    });
+    const doneResult = (await completeAgentInvocation({
+      invocationId: done.invocationId,
+      result: "Child fact: 42.",
+      status: "completed",
+    })) as TerminalAgentInvocation;
+    await enqueueAgentInvocationResult(doneResult, { queue, state });
+    await ackMessages({
+      conversationId: created.conversationId,
+      conversationStore,
+      inboundMessageIds: [getAgentInvocationResultMessageId(done.invocationId)],
+      leaseToken,
+      state,
+    });
     await completeConversationWork({
       conversationId: created.conversationId,
       conversationStore,
@@ -208,6 +231,20 @@ describe("conversation stop API", () => {
       stopConversationTurnResponseSchema.parse(await response.json()),
     ).toMatchObject({ status: "no_work" });
     await expectChildAgentStopped(child, state);
+    // A stop keeps a result that the parent already read. The child's
+    // session still ends, so no watch or queued input starts it again.
+    await expect(getAgentInvocation(done.invocationId)).resolves.toMatchObject({
+      parentMailboxStatus: "appended",
+      status: "completed",
+    });
+    await expect(
+      listChildAgents(created.conversationId),
+    ).resolves.toContainEqual(
+      expect.objectContaining({
+        childConversationId: done.childConversationId,
+        lastResult: "completed",
+      }),
+    );
   });
 
   it("stops child agents when an ACP client cancels the parent Turn", async () => {

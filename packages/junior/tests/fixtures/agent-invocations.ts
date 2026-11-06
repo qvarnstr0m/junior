@@ -188,9 +188,9 @@ export async function expectChildAgentStopped(
       state,
     }),
   ).resolves.toBe(true);
-  await expect(listChildAgents(parentConversationId)).resolves.toEqual([
+  await expect(listChildAgents(parentConversationId)).resolves.toContainEqual(
     expect.objectContaining({ childConversationId, status: "stopped" }),
-  ]);
+  );
 }
 
 /** Wait until the run is aborted, then fail like an aborted agent run. */

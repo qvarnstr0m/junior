@@ -6,7 +6,10 @@ import {
 } from "@/chat/conversations/session-stop";
 import { getSqlExecutor } from "@/chat/db";
 import { cancelSubscriptions } from "@/chat/events/store";
-import { stopConversationWork } from "@/chat/task-execution/store";
+import {
+  getConversationWorkState,
+  stopConversationWork,
+} from "@/chat/task-execution/store";
 import { juniorAgentInvocations } from "@/db/schema";
 import { recordSubagentEnded } from "./markers";
 import { isChildAgentSessionStopped } from "./list";
@@ -16,6 +19,7 @@ import {
   invocationFromRow,
   isTerminalAgentInvocation,
   NON_TERMINAL_AGENT_INVOCATION_STATUSES,
+  parseAgentInvocationResultMessageId,
 } from "./store";
 import type { TerminalAgentInvocation } from "./types";
 
@@ -84,19 +88,59 @@ export async function stopChildAgentsOf(
  * Stop every child agent below a Conversation that a person stops. The
  * Conversation's own agent invocations stay as they are: when it is a child
  * agent, its worker records the stop and reports it to its parent.
+ *
+ * Known gap: the Conversation's run sees its stop only at its next stop
+ * signal check. A child agent that it spawns before then is not stopped.
  */
 export async function stopChildAgentsBelow(
   conversationId: string,
   state?: StateAdapter,
 ): Promise<void> {
-  const tree = await stopAgentInvocationTree(conversationId, Date.now(), {
+  const nowMs = Date.now();
+  const tree = await stopAgentInvocationTree(conversationId, nowMs, {
     includeRoot: false,
   });
+  await skipUnreadResults(conversationId, nowMs, state);
   await finishStoppedTree(
     tree,
     tree.conversationIds.filter((id) => id !== conversationId),
     state,
   );
+}
+
+/**
+ * Skip the `appended` results that still wait in a Conversation's mailbox, so
+ * they start no Turn. A result that the Conversation already read keeps its
+ * status. Call this after the tree stop: it skipped each `pending` result and
+ * stopped each child agent, so no result becomes `appended` after this read.
+ */
+async function skipUnreadResults(
+  conversationId: string,
+  nowMs: number,
+  state: StateAdapter | undefined,
+): Promise<void> {
+  const messages =
+    (await getConversationWorkState({ conversationId, state }))?.messages ?? [];
+  const invocationIds = messages.flatMap((message) => {
+    const invocationId = parseAgentInvocationResultMessageId(
+      message.inboundMessageId,
+    );
+    return invocationId ? [invocationId] : [];
+  });
+  if (invocationIds.length === 0) {
+    return;
+  }
+  await getSqlExecutor()
+    .db()
+    .update(juniorAgentInvocations)
+    .set({ parentMailboxStatus: "skipped", updatedAt: new Date(nowMs) })
+    .where(
+      and(
+        eq(juniorAgentInvocations.parentConversationId, conversationId),
+        inArray(juniorAgentInvocations.invocationId, invocationIds),
+        eq(juniorAgentInvocations.parentMailboxStatus, "appended"),
+      ),
+    );
 }
 
 async function finishStoppedTree(
@@ -205,7 +249,7 @@ export type StoppedAgentTree = {
  * agent below it. Open agent invocations become `stopped`. Results that would
  * still start or report work in the tree become `skipped`. With
  * `includeRoot: false`, the agent invocations of the Conversation itself stay
- * as they are, but results sent to it are still `skipped`.
+ * as they are, and only `pending` results sent to it become `skipped`.
  */
 export async function stopAgentInvocationTree(
   conversationId: string,
@@ -260,11 +304,18 @@ async function stopLockedAgentInvocationTree(
       or(
         // A result sent to the tree would start new work there.
         and(
-          inArray(juniorAgentInvocations.parentConversationId, conversationIds),
+          inArray(juniorAgentInvocations.parentConversationId, stoppedChildIds),
           inArray(juniorAgentInvocations.parentMailboxStatus, [
             "pending",
             "appended",
           ]),
+        ),
+        // With `includeRoot: false`, an `appended` result sent to the
+        // Conversation can be one that it already read, so only `pending`
+        // results are skipped here. See `skipUnreadResults`.
+        and(
+          eq(juniorAgentInvocations.parentConversationId, conversationId),
+          eq(juniorAgentInvocations.parentMailboxStatus, "pending"),
         ),
         // No later agent invocation in the tree sends a `replaced` report.
         and(
