@@ -241,6 +241,11 @@ it("keeps watches passive when the stop drops queued input, but not a re-created
     { after_ms: 600_000, intent: "Check the deployment." },
     "timer-1",
   );
+  await execute(
+    tools.watchTimer!,
+    { after_ms: 1_200_000, intent: "Check again later." },
+    "timer-2",
+  );
   const deployWatch = () =>
     createWatch({
       conversationId,
@@ -276,7 +281,8 @@ it("keeps watches passive when the stop drops queued input, but not a re-created
     expect.stringContaining("Check the deployment."),
   ]);
 
-  // Watching the same resource again creates an active watch.
+  // Watching the same resource again creates an active watch. A passive
+  // timer Event in the same batch is still saved, not run.
   const recreated = await deployWatch();
   await enqueueEventNotification({
     event: {
@@ -290,10 +296,20 @@ it("keeps watches passive when the stop drops queued input, but not a re-created
     queue,
     subscription: recreated,
   });
+  clock.mockReturnValue(clock() + 500_000);
+  await runTimerWatchHeartbeat({ nowMs: clock(), queue });
   clock.mockReturnValue(clock() + 120_000);
   await drain();
   expect(agentRuns).toHaveLength(1);
   expect(agentRuns[0]!.source).toMatchObject({ kind: "event" });
+  // The passive Event reaches the Turn only as transcript context.
+  const { text } = agentRuns[0]!.instruction;
+  expect(text).toContain("Deploy succeeded.");
+  expect(text).not.toContain("Check again later.");
+  expect(await passiveWatchMessageTexts(conversationId)).toEqual([
+    expect.stringContaining("Check the deployment."),
+    expect.stringContaining("Check again later."),
+  ]);
 });
 
 it("saves a stopped child's timers until a person writes to its root", async () => {
@@ -326,6 +342,11 @@ it("saves a stopped child's timers until a person writes to its root", async () 
     childTools.watchTimer!,
     { after_ms: 600_000, intent: "Check later." },
     "child-timer-2",
+  );
+  await execute(
+    childTools.watchTimer!,
+    { after_ms: 3_600_000, intent: "Check much later." },
+    "child-timer-3",
   );
 
   // A person's stop of the root stops the child and makes its watches
@@ -360,4 +381,27 @@ it("saves a stopped child's timers until a person writes to its root", async () 
       .filter((run) => run.conversationId === child.childConversationId)
       .map((run) => run.source.kind),
   ).toEqual(["event"]);
+
+  // A person's stop of only the child stays in effect when a person writes
+  // to the root, because the root itself was not stopped.
+  await stopConversation({ conversationId: child.childConversationId, queue });
+  await drain();
+  clock.mockReturnValue(clock() + 1_000);
+  await fixture.continue({
+    conversationId,
+    idempotencyKey: "after-child-stop",
+    message: "Carry on.",
+  });
+  await drain();
+  clock.mockReturnValue(clock() + 3_600_000);
+  await runTimerWatchHeartbeat({ nowMs: clock(), queue });
+  clock.mockReturnValue(clock() + 120_000);
+  await drain();
+  expect(
+    agentRuns.filter((run) => run.conversationId === child.childConversationId),
+  ).toHaveLength(1);
+  expect(await passiveWatchMessageTexts(child.childConversationId)).toEqual([
+    expect.stringContaining("Check soon."),
+    expect.stringContaining("Check much later."),
+  ]);
 });

@@ -1,5 +1,6 @@
 import type { StateAdapter } from "chat";
-import { and, eq, inArray, lt, sql } from "drizzle-orm";
+import { and, eq, inArray, lt, lte, sql } from "drizzle-orm";
+import { alias } from "drizzle-orm/pg-core";
 import { toStoredConversationMessage } from "@/chat/conversations/messages";
 import { getConversationEventStore, getSqlExecutor } from "@/chat/db";
 import { instructionForInputs } from "@/chat/agent/prompt";
@@ -9,6 +10,7 @@ import {
   renderEventBatchInputs,
 } from "@/chat/events/notification";
 import { cancelSubscriptions, getWatch } from "@/chat/events/store";
+import { getEventBatchDelayMs } from "@/chat/task-execution/mailbox-turn";
 import { eventReviewItemInputs } from "@/chat/review-items/prompt-input";
 import { normalizeConversationText } from "@/chat/services/conversation-memory";
 import type { InboundMessage } from "@/chat/task-execution/store";
@@ -96,14 +98,22 @@ export async function readConversationStop(conversationId: string): Promise<
 }
 
 /**
- * Make the passive Watches of a Conversation and of every child agent below
- * it active again. Only Watches made passive before `beforeMs` change, so a
- * stop that came after the input stays in effect.
+ * Make the passive Watches of a stopped Conversation and of every child agent
+ * below it active again. Nothing changes when the Conversation itself is not
+ * passive. Only Watches made passive before `beforeMs`, and no later than the
+ * Conversation's own Watches, change. So a stop that came after the input, or
+ * a later stop of one child agent, stays in effect.
  */
 export async function reactivateWatchTree(
   conversationId: string,
   beforeMs: number,
 ): Promise<void> {
+  const target = alias(juniorConversations, "target");
+  const targetPassiveAt = getSqlExecutor()
+    .db()
+    .select({ watchesPassiveAt: target.watchesPassiveAt })
+    .from(target)
+    .where(eq(target.conversationId, conversationId));
   await getSqlExecutor()
     .db()
     .update(juniorConversations)
@@ -115,6 +125,7 @@ export async function reactivateWatchTree(
           sql`(select ${conversationSubtreeColumns.conversationId} from ${conversationSubtree([conversationId])})`,
         ),
         lt(juniorConversations.watchesPassiveAt, new Date(beforeMs)),
+        lte(juniorConversations.watchesPassiveAt, targetPassiveAt),
       ),
     );
 }
@@ -125,12 +136,15 @@ export async function reactivateWatchTree(
  * and of its child agents become active again. Input from a parent tool call
  * also runs. Events from passive Watches are saved as one Message and start
  * no Turn. Other Events received at or before the stop are dropped. Returns
- * undefined when the work should run.
+ * the work to run, with only the Events that are left, or the finished result
+ * when nothing is left.
  */
 export async function skipInputAfterConversationStop(
   context: ConversationWorkerContext,
   state?: StateAdapter,
-): Promise<ConversationWorkerResult | undefined> {
+): Promise<
+  { context: ConversationWorkerContext } | { skipped: ConversationWorkerResult }
+> {
   const messages = context.attempt.messages;
   const personInput = messages.filter(isPersonInput);
   if (personInput.length > 0) {
@@ -140,16 +154,17 @@ export async function skipInputAfterConversationStop(
       context.conversationId,
       Math.max(...personInput.map((message) => message.receivedAtMs)),
     );
-    return undefined;
+    return { context };
   }
   if (messages.length === 0 || !messages.every(isEventInput)) {
-    return undefined;
+    return { context };
   }
   const stop = await readConversationStop(context.conversationId);
   if (!stop) {
-    return undefined;
+    return { context };
   }
   const passive: InboundMessage[] = [];
+  const live: InboundMessage[] = [];
   for (const message of messages) {
     const watchId = eventWatchId(message);
     if (
@@ -161,14 +176,35 @@ export async function skipInputAfterConversationStop(
       stop.stoppedAtMs === undefined ||
       message.receivedAtMs > stop.stoppedAtMs
     ) {
-      return undefined;
+      live.push(message);
+    }
+  }
+  if (live.length === messages.length) {
+    return { context };
+  }
+  if (live.length > 0) {
+    // Events of all Watches debounce in one batch. Wait out the window of the
+    // whole batch and of the Events that run before any Event is saved, so a
+    // later attempt does not save the passive Events again.
+    const delayMs = Math.max(
+      getEventBatchDelayMs(messages),
+      getEventBatchDelayMs(live),
+    );
+    if (delayMs > 0) {
+      return { skipped: { status: "deferred", delayMs } };
     }
   }
   if (passive.length > 0) {
     await savePassiveWatchEvents(context.conversationId, passive);
   }
+  if (live.length > 0) {
+    // The ack of the attempt still covers the saved and dropped Events.
+    return {
+      context: { ...context, attempt: { ...context.attempt, messages: live } },
+    };
+  }
   await context.attempt.ack();
-  return { status: "completed" };
+  return { skipped: { status: "completed" } };
 }
 
 function isPersonInput(message: InboundMessage): boolean {

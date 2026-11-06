@@ -339,8 +339,9 @@ async function getChildAgentInputInvocation(
 
 /**
  * Return whether no Watch of these Events ended. The session stop already
- * dropped Events received before it and saved Events from passive Watches,
- * so these come from Watches that a person made active again. A timer is
+ * dropped Events received before it, and saved and removed Events from
+ * passive Watches, also from a batch with other Events. So these come from
+ * active Watches, or have no Watch and start no work. A timer is
  * `completed` once it fires, so only `cancelled` means a stop ended it.
  */
 async function isFromLiveWatches(

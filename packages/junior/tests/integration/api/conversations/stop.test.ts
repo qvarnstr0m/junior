@@ -1,9 +1,10 @@
 import { Hono } from "hono";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { createJuniorApi, type JuniorApiVariables } from "@/api";
 import { createAcpConversations } from "@/api/acp/conversations";
 import { enqueueAgentInvocationResult } from "@/chat/agent-invocations/result";
 import { listChildAgents } from "@/chat/agent-invocations/list";
+import { stopChildAgentsOf } from "@/chat/agent-invocations/stop";
 import {
   completeAgentInvocation,
   createAgentInvocation,
@@ -18,9 +19,14 @@ import {
   webActorFromUser,
 } from "@/chat/conversations/web-input";
 import { legacyWebActorUserId } from "@/chat/conversations/legacy-web-actor-id";
-import { getConversationStoppedAtMs } from "@/chat/conversations/session-stop";
+import {
+  getConversationStoppedAtMs,
+  reactivateWatchTree,
+  readConversationStop,
+} from "@/chat/conversations/session-stop";
 import { getConversationEventStore } from "@/chat/db";
 import { isEventMailboxMetadata } from "@/chat/events/notification";
+import { createWatch, getWatch } from "@/chat/events/store";
 import {
   ackMessages,
   completeConversationWork,
@@ -102,6 +108,7 @@ async function startParentTurn(
 
 describe("conversation stop API", () => {
   afterEach(async () => {
+    vi.restoreAllMocks();
     await closeConversationFixture();
   });
 
@@ -395,5 +402,66 @@ describe("conversation stop API", () => {
       parentMailboxEventTypes(created.conversationId, state),
     ).resolves.toEqual([]);
     await expect(loadTurnEvents(created.conversationId)).resolves.toEqual([]);
+  });
+
+  it("keeps the Watches below a child agent when its run sees the stop late", async () => {
+    const clock = vi.spyOn(Date, "now").mockReturnValue(1_800_000_000_000);
+    const fixture = await createConversationFixture();
+    const { actor, conversationStore, queue, state } = fixture;
+    const { created } = await startParentTurn(fixture, "late-cascade-root");
+    const child = await startRunningChildAgent({
+      conversationStore,
+      idempotencyKey: "late-cascade-child",
+      parentConversationId: created.conversationId,
+      queue,
+      state,
+    });
+    const grandchild = await createAgentInvocation({
+      ...invocationInput,
+      idempotencyKey: "late-cascade-grandchild",
+      parentConversationId: child.invocation.childConversationId,
+    });
+    const watch = await createWatch(
+      {
+        conversationId: grandchild.childConversationId,
+        events: ["deployment.succeeded"],
+        expiresAtMs: clock() + 3_600_000,
+        identifier: "prj_junior:production",
+        intent: "Report deploy results.",
+        label: "Vercel deployment junior-prod",
+        namespace: "vercel",
+        resourceType: "deployment",
+      },
+      { state },
+    );
+    const response = await stopRequest(
+      fixture,
+      created.conversationId,
+      actor.email,
+    );
+    expect(response.status).toBe(200);
+    const stopped = await readConversationStop(grandchild.childConversationId);
+    expect(stopped?.watchesPassiveAtMs).toBe(clock());
+
+    // The child's run sees the stop later and stops its own child agents.
+    // That does not move the stop of a Conversation that is already stopped.
+    clock.mockReturnValue(clock() + 1_000);
+    await stopChildAgentsOf(child.invocation.childConversationId, state);
+    await expect(
+      readConversationStop(grandchild.childConversationId),
+    ).resolves.toEqual(stopped);
+
+    // After a person's input to the root makes the tree active again, a late
+    // cascade does not cancel the grandchild's Watch.
+    clock.mockReturnValue(clock() + 1_000);
+    await reactivateWatchTree(created.conversationId, clock());
+    clock.mockReturnValue(clock() + 1_000);
+    await stopChildAgentsOf(child.invocation.childConversationId, state);
+    await expect(
+      readConversationStop(grandchild.childConversationId),
+    ).resolves.toEqual({ stoppedAtMs: stopped?.stoppedAtMs });
+    await expect(getWatch({ id: watch.id, state })).resolves.toMatchObject({
+      status: "active",
+    });
   });
 });

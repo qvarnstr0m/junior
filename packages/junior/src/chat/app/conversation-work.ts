@@ -175,16 +175,17 @@ export function createConversationWork(
     );
   };
   const run = async (
-    context: ConversationWorkerContext,
+    attemptContext: ConversationWorkerContext,
   ): Promise<ConversationWorkerResult> => {
     // Apply a session stop to automated input, on a root or a child.
-    const skipped = await skipInputAfterConversationStop(
-      context,
+    const stopped = await skipInputAfterConversationStop(
+      attemptContext,
       options.state,
     );
-    if (skipped) {
-      return skipped;
+    if ("skipped" in stopped) {
+      return stopped.skipped;
     }
+    const { context } = stopped;
     // The stored parent decides the kind of Conversation, so child work never
     // reaches a root worker. A child Turn can have any Source.
     const conversation = await options.conversationStore.get({

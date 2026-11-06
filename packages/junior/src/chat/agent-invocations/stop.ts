@@ -63,6 +63,11 @@ export async function stopChildAgent(args: {
  * The worker of that Conversation calls this after it records its own stop,
  * so this sends no stop request to that Conversation. Their Watches become
  * passive when a person stopped it, and end when an agent stopped it.
+ *
+ * The worker can see its stop late, after a person's input made the tree
+ * active again. So this ends only the sessions of child agents whose work
+ * it stopped itself, such as one spawned before the worker saw the stop. A
+ * child agent that the first stop already stopped keeps its session state.
  */
 export async function stopChildAgentsOf(
   conversationId: string,
@@ -70,14 +75,14 @@ export async function stopChildAgentsOf(
 ): Promise<void> {
   const stop = await readConversationStop(conversationId);
   const tree = await stopAgentInvocationTree(conversationId);
-  await finishStoppedTree(
-    tree,
-    tree.conversationIds.filter((id) => id !== conversationId),
-    {
-      state,
-      watches: stop?.watchesPassiveAtMs === undefined ? "cancel" : "passive",
-    },
+  const stoppedIds = new Set(
+    tree.stopped.map((invocation) => invocation.childConversationId),
   );
+  stoppedIds.delete(conversationId);
+  await finishStoppedTree(tree, [...stoppedIds], {
+    state,
+    watches: stop?.watchesPassiveAtMs === undefined ? "cancel" : "passive",
+  });
 }
 
 /**
@@ -88,7 +93,8 @@ export async function stopChildAgentsOf(
  *
  * Known gap: the Conversation's run sees its stop only at its next stop
  * signal check. A child agent that it spawns or gives new work to before
- * then is not stopped.
+ * then is not stopped, and a `messageAgent` call then makes the Watches of
+ * that child agent active again.
  */
 export async function stopChildAgentsBelow(
   conversationId: string,

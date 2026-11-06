@@ -265,9 +265,12 @@ async function prepareLocalChatRun(
     await processConversationWork(message, {
       queue: localConversationWork.queue,
       // The local queue carries only child Conversation work.
-      run: async (context) =>
-        (await skipInputAfterConversationStop(context)) ??
-        (await childWorker(context)),
+      run: async (context) => {
+        const stopped = await skipInputAfterConversationStop(context);
+        return "skipped" in stopped
+          ? stopped.skipped
+          : await childWorker(stopped.context);
+      },
     });
   });
   agentRunner = createAgentRunner(executeAgentRun, {
