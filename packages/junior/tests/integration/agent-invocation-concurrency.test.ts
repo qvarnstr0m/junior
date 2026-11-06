@@ -575,7 +575,10 @@ describe("agent invocation identity and concurrency", () => {
       );
       clock.mockReturnValue(clock() + 120_000);
       await runTimerWatchHeartbeat({ nowMs: clock(), queue: harness.queue });
-      const stopAgent = createStopAgentTool(parentConversationId);
+      const stopAgent = createStopAgentTool(
+        parentConversationId,
+        () => harness.queue,
+      );
       await expect(
         stopAgent.execute!({ conversation_id: child.childConversationId }, {}),
       ).resolves.toMatchObject({ stopped: true });

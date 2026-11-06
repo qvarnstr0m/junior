@@ -221,7 +221,10 @@ export function createTools(
 
   if (context.spawnAgent) {
     tools.spawnAgent = createSpawnAgentTool(context.spawnAgent);
-    tools.stopAgent = createStopAgentTool(context.conversationId);
+    tools.stopAgent = createStopAgentTool(
+      context.conversationId,
+      () => context.conversationWorkQueue ?? getVercelConversationWorkQueue(),
+    );
   }
 
   // A child agent that is too deep to start child agents can still find its

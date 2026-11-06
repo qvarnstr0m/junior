@@ -2,6 +2,7 @@ import * as z from "zod";
 import { stopChildAgent } from "@/chat/agent-invocations/stop";
 import { juniorToolOutputSchema } from "@/chat/tool-support/structured-result";
 import { zodTool } from "@/chat/tool-support/zod-tool";
+import type { ConversationWorkQueue } from "@/chat/task-execution/queue";
 import { ToolInputError } from "@/chat/tools/execution/tool-input-error";
 
 const stopAgentOutputSchema = juniorToolOutputSchema.extend({
@@ -14,7 +15,10 @@ const stopAgentOutputSchema = juniorToolOutputSchema.extend({
 });
 
 /** Create the tool that stops one child agent of one conversation. */
-export function createStopAgentTool(conversationId: string) {
+export function createStopAgentTool(
+  conversationId: string,
+  getQueue: () => ConversationWorkQueue,
+) {
   return zodTool({
     description:
       "Stop a child agent that this conversation started, and every child agent it started. Use it when the child agent's work is no longer needed or goes in the wrong direction. A stopped child agent sends no result. To give it new work later, use messageAgent.",
@@ -40,6 +44,7 @@ export function createStopAgentTool(conversationId: string) {
       const stopped = await stopChildAgent({
         childConversationId: input.conversation_id,
         parentConversationId: conversationId,
+        queue: getQueue(),
       });
       if (!stopped) {
         throw new ToolInputError(

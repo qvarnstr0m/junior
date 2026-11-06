@@ -36,6 +36,7 @@ import {
   markAgentInvocationParentMailboxAppended,
 } from "./store";
 import { listUnreportedSiblingAgents } from "./list";
+import { isThreadRestartedByPerson } from "./thread-turn";
 import type {
   AgentInvocation,
   ChildAgent,
@@ -384,11 +385,13 @@ async function startAgentInvocationsForChildInput(
   }
   // A stopped child takes no new work, even from input sent before the stop.
   // A tree stop leaves a `replaced` agent invocation with its finished status
-  // and marks it `skipped`, so that also means stopped.
+  // and marks it `skipped`, so that also means stopped. A person's message
+  // after the stop restarts a Thread.
   if (
-    latest.status === "stopped" ||
-    (isTerminalAgentInvocation(latest) &&
-      latest.parentMailboxStatus === "skipped")
+    (latest.status === "stopped" ||
+      (isTerminalAgentInvocation(latest) &&
+        latest.parentMailboxStatus === "skipped")) &&
+    !(await isThreadRestartedByPerson(context.conversationId))
   ) {
     await context.attempt.ack();
     return { status: "completed" };

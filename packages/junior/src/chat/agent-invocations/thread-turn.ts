@@ -8,7 +8,9 @@ import type { Destination } from "@sentry/junior-plugin-api";
 import type { StateAdapter } from "chat";
 import type { LocationConfigurationService } from "@/chat/configuration/types";
 import { hydrateConversationMessages } from "@/chat/conversations/messages";
+import { getConversationStoppedAtMs } from "@/chat/conversations/session-stop";
 import type { Conversation } from "@/chat/conversations/store";
+import { getConversationStore } from "@/chat/db";
 import { getLocationConfigurationServiceForLocation } from "@/chat/runtime/location-configuration";
 import { getPersistedThreadState } from "@/chat/runtime/thread-state";
 import { buildConversationContext } from "@/chat/services/conversation-memory";
@@ -175,4 +177,29 @@ async function loadRootContext(
     context,
     "</root-conversation>",
   ].join("\n");
+}
+
+/**
+ * Return whether a person messaged a Thread after its latest stop. That
+ * restarts the Thread, so later results and watch Events run again. A Task
+ * takes no input from people, so this is false for it.
+ */
+export async function isThreadRestartedByPerson(
+  conversationId: string,
+): Promise<boolean> {
+  const conversation = await getConversationStore().get({ conversationId });
+  const stoppedAtMs = await getConversationStoppedAtMs(conversationId);
+  if (conversation?.kind !== "thread" || stoppedAtMs === undefined) {
+    return false;
+  }
+  const thread = coerceThreadConversationState(
+    await getPersistedThreadState(conversationId),
+  );
+  await hydrateConversationMessages({ conversation: thread, conversationId });
+  return thread.messages.some(
+    (message) =>
+      message.role === "user" &&
+      message.meta?.source === "web" &&
+      message.createdAtMs > stoppedAtMs,
+  );
 }

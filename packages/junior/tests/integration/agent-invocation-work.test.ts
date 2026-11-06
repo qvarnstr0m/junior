@@ -592,7 +592,7 @@ describe("agent invocation conversation work", () => {
         if (stopBeforeWake) {
           // The stop request outlives the paused run. The stopped agent
           // invocation takes the resume wake and does not run again.
-          await createStopAgentTool(parentConversationId).execute!(
+          await createStopAgentTool(parentConversationId, () => queue).execute!(
             { conversation_id: childConversationId },
             {},
           );

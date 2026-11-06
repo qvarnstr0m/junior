@@ -658,7 +658,8 @@ export function createAgentInvocationWorker(
   options: {
     enqueueResult?: (invocation: TerminalAgentInvocation) => Promise<void>;
     maxAgentDepth?: number;
-  } = {},
+    queue: ConversationWorkQueue;
+  },
 ) {
   const maxAgentDepth = options.maxAgentDepth ?? 0;
   return async (
@@ -717,7 +718,7 @@ export function createAgentInvocationWorker(
           status: "stopped",
         }),
       );
-      await stopChildAgentsOf(context.conversationId);
+      await stopChildAgentsOf(context.conversationId, { queue: options.queue });
       await acknowledge();
       return { status: "completed" };
     };
@@ -938,7 +939,7 @@ export function createAgentInvocationWorker(
       ) {
         terminal = await reportReplacedAgentInvocation(terminal.invocationId);
       }
-      await stopChildAgentsOf(context.conversationId);
+      await stopChildAgentsOf(context.conversationId, { queue: options.queue });
     }
     if (terminal && isTerminalAgentInvocation(terminal)) {
       await report(terminal);

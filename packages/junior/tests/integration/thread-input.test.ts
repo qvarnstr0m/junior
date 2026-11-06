@@ -1,6 +1,6 @@
 import { createSlackSource, createWebSource } from "@sentry/junior-plugin-api";
 import { eq } from "drizzle-orm";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { createAcpConversations } from "@/api/acp/conversations";
 import { bindMessageAgent } from "@/chat/agent-invocations/message";
 import {
@@ -20,6 +20,9 @@ import {
   webActorFromUser,
 } from "@/chat/conversations/web-input";
 import { getConversationEventStore, getDb } from "@/chat/db";
+import { EVENT_SYSTEM_ACTOR } from "@/chat/events/actor";
+import { getEventCatalog } from "@/chat/events/runtime-catalog";
+import { runTimerWatchHeartbeat } from "@/chat/events/timers";
 import { resolveViewerUser } from "@/chat/plugins/viewer";
 import {
   getLocationConfigurationService,
@@ -36,7 +39,9 @@ import { recordTurnAuthorization } from "@/chat/task-execution/authorized-turn";
 import { getAuthPausedConversationTurnId } from "@/chat/task-execution/mailbox-turn";
 import { getConversationWorkState } from "@/chat/task-execution/store";
 import { wakePausedTurn } from "@/chat/task-execution/turn-wake";
+import { createEventTools } from "@/chat/tools/events";
 import { createMessageAgentTool } from "@/chat/tools/runtime/message-agent";
+import { createStopAgentTool } from "@/chat/tools/runtime/stop-agent";
 import { juniorConversations } from "@/db/schema";
 import {
   prepareSlackParentConversation,
@@ -45,6 +50,7 @@ import {
   slackParentConversationId,
 } from "../fixtures/agent-invocations";
 import { webTestActor } from "../fixtures/conversation";
+import { context, execute } from "../fixtures/event-automations";
 import { createConversationWorkHarness } from "../fixtures/conversation-work";
 
 /** Compose production Conversation work with a Slack root. */
@@ -67,6 +73,21 @@ async function createHarness() {
     /** Run the next queued wake of one Conversation. */
     process: async (conversationId: string) =>
       await work.process(work.queue.takeMessageFor(conversationId)),
+    /**
+     * Run the queued wakes of one Conversation until the agent runs. A run
+     * that the runner stops retries, so this stops at the first run.
+     */
+    processUntilRun: async (conversationId: string) => {
+      const runCount = runs.length;
+      while (
+        runs.length === runCount &&
+        work.queue
+          .queuedMessages()
+          .some((message) => message.conversationId === conversationId)
+      ) {
+        await work.process(work.queue.takeMessageFor(conversationId));
+      }
+    },
     queue: work.queue,
     runs,
     state: work.state,
@@ -169,19 +190,19 @@ async function sendParentMessage(harness: Harness, toolCallId: string) {
   );
 }
 
-/**
- * Save what a sign-in pause leaves: the person's Message and their Turn,
- * which waits for a sign-in callback.
- */
-async function savePersonTurnPausedForSignIn(threadId: string) {
-  const messageId = "api-msg_person-paused";
+/** Save the Message that a person's Turn in a Thread stores first. */
+async function savePersonMessage(
+  threadId: string,
+  messageId: string,
+  createdAtMs: number,
+) {
   await persistThreadStateById(threadId, {
     conversation: {
       ...coerceThreadConversationState({}),
       messages: [
         {
           author: { userName: webTestActor.userName },
-          createdAtMs: 1,
+          createdAtMs,
           id: messageId,
           meta: { explicitMention: true, source: "web" },
           role: "user",
@@ -190,6 +211,15 @@ async function savePersonTurnPausedForSignIn(threadId: string) {
       ],
     },
   });
+}
+
+/**
+ * Save what a sign-in pause leaves: the person's Message and their Turn,
+ * which waits for a sign-in callback.
+ */
+async function savePersonTurnPausedForSignIn(threadId: string) {
+  const messageId = "api-msg_person-paused";
+  await savePersonMessage(threadId, messageId, 1);
   const turnId = buildDeterministicTurnId(messageId);
   await saveTurnCheckpoint({
     mode: "paused",
@@ -210,6 +240,14 @@ async function savePersonTurnPausedForSignIn(threadId: string) {
     surface: "api",
   });
   return turnId;
+}
+
+/** Stop the Thread from its parent with the stopAgent tool. */
+async function stopThread(harness: Harness, threadId: string) {
+  await expect(
+    createStopAgentTool(slackParentConversationId, () => harness.queue)
+      .execute!({ conversation_id: threadId }, {}),
+  ).resolves.toMatchObject({ stopped: true });
 }
 
 describe("Thread input", () => {
@@ -436,6 +474,90 @@ describe("Thread input", () => {
       });
       expect(resumed[0]?.agentInvocationId).toBeUndefined();
     } finally {
+      await harness.close();
+    }
+  });
+
+  it("ends a person's Turn that waits for sign-in when the tree stops", async () => {
+    const harness = await createHarness();
+    try {
+      const threadId = await startThread(harness, "thread-spawn");
+      await harness.process(threadId);
+      await finishInvocation(harness, threadId);
+      const personTurnId = await savePersonTurnPausedForSignIn(threadId);
+      const paused = await getTurnRecord(threadId, personTurnId);
+      const runCount = harness.runs.length;
+
+      await stopThread(harness, threadId);
+      await harness.process(threadId);
+      await expect(
+        getAuthPausedConversationTurnId(threadId),
+      ).resolves.toBeUndefined();
+
+      // A sign-in that completes later does not resume the stopped Thread.
+      await wakePausedTurn(
+        {
+          conversationId: threadId,
+          destination: slackDestination,
+          expectedVersion: paused!.version,
+          turnId: personTurnId,
+        },
+        {
+          conversationStore: harness.conversationStore,
+          queue: harness.queue,
+          state: harness.state,
+        },
+      );
+      await harness.processUntilRun(threadId);
+      expect(harness.runs).toHaveLength(runCount);
+    } finally {
+      await harness.close();
+    }
+  });
+
+  it("runs watch Events in a stopped Thread after a person messages it", async () => {
+    const clock = vi.spyOn(Date, "now").mockReturnValue(1_800_000_000_000);
+    const harness = await createHarness();
+    try {
+      // The stop ends the open Agent invocation before it runs.
+      const threadId = await startThread(harness, "thread-spawn");
+      await stopThread(harness, threadId);
+      await harness.processUntilRun(threadId);
+      expect(harness.runs).toHaveLength(0);
+      const tools = createEventTools(
+        { ...context(), conversationId: threadId },
+        getEventCatalog(),
+      );
+      /** Set a timer on the Thread, fire it, and run its wakes. */
+      const fireTimer = async (toolCallId: string) => {
+        await execute(
+          tools.watchTimer!,
+          { after_ms: 60_000, intent: "Check the deploy again." },
+          toolCallId,
+        );
+        clock.mockReturnValue(clock() + 120_000);
+        await runTimerWatchHeartbeat({ nowMs: clock(), queue: harness.queue });
+        // The Event batch waits for its burst window.
+        clock.mockReturnValue(clock() + 120_000);
+        await harness.processUntilRun(threadId);
+      };
+
+      // The stopped Thread drops a watch Event that arrives after the stop.
+      clock.mockReturnValue(clock() + 1_000);
+      await fireTimer("timer-1");
+      expect(harness.runs).toHaveLength(0);
+
+      // A person's message restarts it.
+      await savePersonMessage(threadId, "api-msg_person-1", clock());
+      clock.mockReturnValue(clock() + 1_000);
+      await fireTimer("timer-2");
+      expect(harness.runs.at(-1)).toMatchObject({
+        actor: EVENT_SYSTEM_ACTOR,
+        agentInvocationId: expect.any(String),
+        conversationId: threadId,
+      });
+    } finally {
+      clock.mockRestore();
       await harness.close();
     }
   });
