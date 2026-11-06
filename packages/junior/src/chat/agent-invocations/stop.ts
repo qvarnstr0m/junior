@@ -87,7 +87,8 @@ export async function stopChildAgentsOf(
 /**
  * Stop every child agent below a Conversation that a person stops. The
  * Conversation's own agent invocations stay as they are: when it is a child
- * agent, its worker records the stop and reports it to its parent.
+ * agent, its worker records the stop and reports it to its parent. Callers
+ * must run `stopConversationTurn` for the Conversation next.
  *
  * Known gap: the Conversation's run sees its stop only at its next stop
  * signal check. A child agent that it spawns before then is not stopped.
@@ -113,6 +114,11 @@ export async function stopChildAgentsBelow(
  * they start no Turn. A result that the Conversation already read keeps its
  * status. Call this after the tree stop: it skipped each `pending` result and
  * stopped each child agent, so no result becomes `appended` after this read.
+ *
+ * The mailbox read is not atomic with the parent worker. A worker that takes
+ * a result before this update holds the work lease, so the
+ * `stopConversationTurn` that each caller runs next stops its Turn. A result
+ * that such a Turn took but did not ack yet is marked `skipped`.
  */
 async function skipUnreadResults(
   conversationId: string,
