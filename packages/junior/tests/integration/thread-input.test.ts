@@ -10,7 +10,9 @@ import {
   markAgentInvocationRunning,
 } from "@/chat/agent-invocations/store";
 import { createAndEnqueueAgentInvocation } from "@/chat/agent-invocations/work";
+import { checkRunConsistency } from "@/chat/agent/run-consistency";
 import type { AgentRun } from "@/chat/agent/types";
+import type { CreateAgentInvocationInput } from "@/chat/agent-invocations/types";
 import {
   appendAndEnqueueWebMessage,
   createAndEnqueueConversation,
@@ -48,11 +50,13 @@ import { createConversationWorkHarness } from "../fixtures/conversation-work";
 /** Compose production Conversation work with a Slack root. */
 async function createHarness() {
   const { conversationStore, fixture } = await prepareSlackParentConversation();
-  // Integration tests do not run the agent. The runner reads each run and
-  // stops it, and the test finishes each Agent invocation itself.
+  // Integration tests do not run the agent. The runner checks each run as
+  // the agent does first, reads it, and stops it. The test finishes each
+  // Agent invocation itself.
   const runs: AgentRun[] = [];
   const work = await createConversationWorkHarness({
     run: async (run) => {
+      await checkRunConsistency(run);
       runs.push(run);
       throw new Error("stop after reading the run");
     },
@@ -90,9 +94,20 @@ async function finishInvocation(harness: Harness, childConversationId: string) {
  * Start a named child agent and store it as a Thread. Spawn creates only
  * Tasks until Threads have their own entry point.
  */
-async function startThread(harness: Harness, idempotencyKey: string) {
+async function startThread(
+  harness: Harness,
+  idempotencyKey: string,
+  input: Partial<
+    Pick<CreateAgentInvocationInput, "destination" | "parentConversationId">
+  > = {},
+) {
   const created = await createAndEnqueueAgentInvocation(
-    { ...slackInvocationInput, agentName: "researcher", idempotencyKey },
+    {
+      ...slackInvocationInput,
+      ...input,
+      agentName: "researcher",
+      idempotencyKey,
+    },
     {
       conversationStore: harness.conversationStore,
       queue: harness.queue,
@@ -270,6 +285,49 @@ describe("Thread input", () => {
         state: harness.state,
       });
       expect(parentWork?.messages).toHaveLength(1);
+    } finally {
+      await harness.close();
+    }
+  });
+
+  it("runs a person's Turn in a Thread under a web root", async () => {
+    const harness = await createHarness();
+    try {
+      const viewer = await resolveViewerUser(webTestActor.email);
+      if (!viewer) throw new Error("Expected a web test viewer");
+      const root = await createAndEnqueueConversation(
+        {
+          actor: webActorFromUser(viewer),
+          idempotencyKey: "web-root",
+          message: "Start the work.",
+        },
+        {
+          conversationStore: harness.conversationStore,
+          queue: harness.queue,
+          state: harness.state,
+        },
+      );
+      const rootDestination = {
+        platform: "local",
+        conversationId: root.conversationId,
+      } as const;
+      const threadId = await startThread(harness, "thread-spawn", {
+        destination: rootDestination,
+        parentConversationId: root.conversationId,
+      });
+      await harness.process(threadId);
+      await finishInvocation(harness, threadId);
+
+      await sendPersonMessage(harness, threadId, "person-1");
+      await harness.process(threadId);
+
+      // The Turn replies in the Thread with the Destination of its root.
+      expect(harness.runs.at(-1)).toMatchObject({
+        actor: webTestActor,
+        conversationId: threadId,
+        destination: rootDestination,
+        source: { conversationId: threadId, kind: "web" },
+      });
     } finally {
       await harness.close();
     }
