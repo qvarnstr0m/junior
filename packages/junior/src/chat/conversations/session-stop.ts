@@ -2,12 +2,14 @@ import type { StateAdapter } from "chat";
 import { and, eq, inArray, isNotNull } from "drizzle-orm";
 import { appendConversationMessages } from "@/chat/conversations/messages";
 import { getConversationEventStore, getSqlExecutor } from "@/chat/db";
+import { instructionForInputs } from "@/chat/agent/prompt";
 import {
   eventBatchMessageMeta,
   isEventMailboxMetadata,
-  renderEventBatchText,
+  renderEventBatchInputs,
 } from "@/chat/events/notification";
 import { getWatch } from "@/chat/events/store";
+import { eventReviewItemInputs } from "@/chat/review-items/prompt-input";
 import {
   normalizeConversationText,
   upsertConversationMessage,
@@ -180,11 +182,16 @@ async function savePassiveWatchEvents(
   messages: readonly InboundMessage[],
 ): Promise<void> {
   const first = messages[0]!;
+  const { text } = instructionForInputs(
+    renderEventBatchInputs(messages, await eventReviewItemInputs(messages)).map(
+      (input) => ({ kind: "runtime" as const, text: input }),
+    ),
+  );
   const conversation = coerceThreadConversationState(undefined);
   upsertConversationMessage(conversation, {
     id: first.inboundMessageId,
     role: "user",
-    text: normalizeConversationText(renderEventBatchText(messages)),
+    text: normalizeConversationText(text),
     createdAtMs: first.createdAtMs,
     ...(first.input.authorIdentityId
       ? { authorIdentityId: first.input.authorIdentityId }
