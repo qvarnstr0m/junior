@@ -121,64 +121,80 @@ function hasEventActor(actors: readonly Actor[] | undefined): boolean {
   );
 }
 
-/** Return the active web Turn for one Conversation, if it has one. */
-export async function getActiveConversationTurnId(
+/** A paused or running Turn that web input or an Event batch started. */
+type ActiveMailboxTurn = { kind: "event" | "web"; record: TurnRecord };
+
+/**
+ * Classify one Turn record. Agent dispatch and Agent invocation Turns are
+ * never mailbox Turns, even when their Source is web or Event.
+ *
+ * TODO(dcramer): Remove the legacy surface and Actor checks after deployed
+ * Turn cursors all store Source.kind.
+ */
+function mailboxTurnKind(
+  record: TurnRecord,
+): ActiveMailboxTurn["kind"] | undefined {
+  if (
+    record.dispatchId ||
+    record.surface === "internal" ||
+    (record.state !== "paused" && record.state !== "running")
+  ) {
+    return undefined;
+  }
+  if (
+    record.source?.kind === "web" ||
+    (!record.source && record.surface === "api")
+  ) {
+    return "web";
+  }
+  if (
+    record.source?.kind === "event" ||
+    (!record.source && hasEventActor(record.actors))
+  ) {
+    return "event";
+  }
+  return undefined;
+}
+
+/** Return the web and Event mailbox Turns that are paused or running. */
+export async function listActiveMailboxTurns(
   conversationId: string,
-): Promise<string | undefined> {
+): Promise<ActiveMailboxTurn[]> {
   const summaries = await listTurnSummaries(conversationId);
-  // TODO(dcramer): Remove the surface check after Turn checkpoints store
-  // Source.kind and web Turn lookup reads it. Agent dispatch also writes the
-  // "api" surface, so its Turns must be excluded by dispatchId until then.
-  const active = summaries.filter(
-    (summary) =>
-      summary.surface === "api" &&
-      !summary.dispatchId &&
-      (summary.state === "paused" || summary.state === "running"),
+  const records = await Promise.all(
+    summaries
+      .filter(
+        (summary) =>
+          !summary.dispatchId &&
+          (summary.state === "paused" || summary.state === "running"),
+      )
+      .map((summary) => getTurnRecord(conversationId, summary.turnId)),
+  );
+  return records.flatMap((record) => {
+    const kind = record ? mailboxTurnKind(record) : undefined;
+    return record && kind ? [{ kind, record }] : [];
+  });
+}
+
+async function getActiveWebTurn(
+  conversationId: string,
+): Promise<TurnRecord | undefined> {
+  const active = (await listActiveMailboxTurns(conversationId)).filter(
+    (turn) => turn.kind === "web",
   );
   if (active.length > 1) {
     throw new Error(
       `Conversation ${conversationId} has multiple active web turns`,
     );
   }
-  const turnId = active[0]?.turnId;
-  if (!turnId) return undefined;
-  const record = await getTurnRecord(conversationId, turnId);
-  return record &&
-    (record.source?.kind === "web" ||
-      (!record.source && record.surface === "api")) &&
-    !record.dispatchId &&
-    (record.state === "paused" || record.state === "running")
-    ? turnId
-    : undefined;
+  return active[0]?.record;
 }
 
-/** Return the web and event mailbox Turns that are paused or running. */
-export async function listActiveMailboxTurns(
+/** Return the active web Turn for one Conversation, if it has one. */
+export async function getActiveConversationTurnId(
   conversationId: string,
-): Promise<TurnRecord[]> {
-  const summaries = await listTurnSummaries(conversationId);
-  // TODO(dcramer): Remove the legacy surface and Actor checks after deployed
-  // Turn cursors all store Source.kind.
-  return (
-    await Promise.all(
-      summaries
-        .filter(
-          (summary) =>
-            !summary.dispatchId &&
-            (summary.state === "paused" || summary.state === "running"),
-        )
-        .map((summary) => getTurnRecord(conversationId, summary.turnId)),
-    )
-  ).filter(
-    (record): record is TurnRecord =>
-      record !== undefined &&
-      !record.dispatchId &&
-      (record.source?.kind === "web" ||
-        record.source?.kind === "event" ||
-        (!record.source &&
-          (record.surface === "api" || hasEventActor(record.actors)))) &&
-      (record.state === "paused" || record.state === "running"),
-  );
+): Promise<string | undefined> {
+  return (await getActiveWebTurn(conversationId))?.turnId;
 }
 
 /** Return the active web or event mailbox Turn. */
@@ -191,22 +207,21 @@ async function getActiveMailboxTurnId(
       `Conversation ${conversationId} has multiple active mailbox Turns`,
     );
   }
-  return active[0]?.turnId;
+  return active[0]?.record.turnId;
 }
 
 /** Return the idle auth-paused web Turn for one Conversation. */
 export async function getAuthPausedConversationTurnId(
   conversationId: string,
 ): Promise<string | undefined> {
-  const turnId = await getActiveConversationTurnId(conversationId);
-  if (!turnId) return undefined;
-  const record = await getTurnRecord(conversationId, turnId);
+  const record = await getActiveWebTurn(conversationId);
   return record?.state === "paused" && record.resumeReason === "auth"
-    ? turnId
+    ? record.turnId
     : undefined;
 }
 
-function parseWebMessages(
+/** Read one web input batch as Turn input. A batch with no web input gives []. */
+export function parseWebMessages(
   messages: readonly InboundMessage[],
 ): MailboxTurnInput[] {
   if (messages.length === 0) {

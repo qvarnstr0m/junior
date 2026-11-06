@@ -11,7 +11,10 @@ import {
   agentInstructionProvenance,
   sameActorIdentity,
 } from "@/chat/conversations/provenance";
-import type { ConversationStore } from "@/chat/conversations/store";
+import type {
+  Conversation,
+  ConversationStore,
+} from "@/chat/conversations/store";
 import { openConversationProjection } from "@/chat/conversations/projection";
 import { ConversationTurnLifecycleService } from "@/chat/conversations/turn-lifecycle";
 import { getConversationEventStore, getConversationStore } from "@/chat/db";
@@ -625,12 +628,12 @@ async function saveAgentInvocationResult(args: {
 }
 
 /**
- * Read how many parents a child Conversation has and the root Conversation's
- * Location. A child of the root has depth 1.
+ * Read how many parents a child Conversation has, and the root Conversation
+ * with its Location. A child of the root has depth 1.
  */
-async function readChildDepthAndRootLocation(
+export async function readChildDepthAndRootLocation(
   conversationId: string,
-): Promise<{ depth: number; location?: Location }> {
+): Promise<{ depth: number; location?: Location; root?: Conversation }> {
   const conversationStore = getConversationStore();
   let depth = 0;
   let conversation = await conversationStore.get({ conversationId });
@@ -640,7 +643,7 @@ async function readChildDepthAndRootLocation(
       conversationId: conversation.parentConversationId,
     });
   }
-  return { depth, location: conversation?.location };
+  return { depth, location: conversation?.location, root: conversation };
 }
 
 /**

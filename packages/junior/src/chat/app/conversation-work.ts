@@ -23,6 +23,7 @@ import {
 } from "@/chat/agent-invocations/result";
 import { botConfig } from "@/chat/config";
 import { skipInputBeforeConversationStop } from "@/chat/conversations/session-stop";
+import { resolveThreadTurnWork } from "@/chat/agent-invocations/thread-turn";
 import { createConversationTurnWorker } from "@/chat/task-execution/conversation-turn";
 import { resolveMailboxTurnWork } from "@/chat/task-execution/mailbox-turn";
 import {
@@ -182,11 +183,19 @@ export function createConversationWork(
     if (skipped) {
       return skipped;
     }
-    // The stored parent decides the kind of Conversation, so child work never
-    // reaches a root worker. A child Turn can have any Source.
+    // The stored kind decides the worker, so child work never reaches a root
+    // worker. A child Turn can have any Source. A person's Turn in a Thread
+    // runs like a web Turn on a root. Agent invocations, their input, and
+    // watch Events keep the child worker.
     const conversation = await options.conversationStore.get({
       conversationId: context.conversationId,
     });
+    if (conversation?.kind === "thread") {
+      const threadTurn = await resolveThreadTurnWork(context);
+      return threadTurn
+        ? await conversationTurnWorker(context, threadTurn)
+        : await childWorker(context);
+    }
     if (conversation?.parentConversationId) {
       return await childWorker(context);
     }

@@ -30,6 +30,7 @@ import {
   turnInputTelemetry,
   withTurnSpan,
 } from "@/chat/task-execution/turn-telemetry";
+import type { AgentFeature } from "@/chat/agent/types";
 import type { AgentRunner } from "@/chat/runtime/agent-runner";
 import { AgentRunError, executeTurn } from "@/chat/runtime/turn-execution";
 import { buildDeliveredTurnStatePatch } from "@/chat/runtime/delivered-turn-state";
@@ -102,6 +103,7 @@ import {
   timerWatchCredentialSubject,
 } from "@/chat/events/notification";
 import { isEventConversationMessage } from "@/chat/events/actor";
+import { loadThreadTurnSetup } from "@/chat/agent-invocations/thread-turn";
 import type { InboundMessage } from "@/chat/task-execution/store";
 import type { CredentialSubject } from "@/chat/credentials/context";
 import { verifyTimerWatchCredentialSubject } from "@/chat/credentials/subject";
@@ -252,17 +254,23 @@ export function createConversationTurnWorker(
     const storedConversation = await getConversationStore().get({
       conversationId: context.conversationId,
     });
+    const thread =
+      storedConversation?.kind === "thread"
+        ? await loadThreadTurnSetup(storedConversation)
+        : undefined;
     const mailboxDestination =
       resolved.kind === "mailbox"
         ? resolved.batch[0]?.message.destination
         : undefined;
-    const destination = resolveConversationDestination({
-      conversationId: context.conversationId,
-      existing:
-        context.destination ??
-        mailboxDestination ??
-        storedConversation?.destination,
-    });
+    const destination =
+      thread?.destination ??
+      resolveConversationDestination({
+        conversationId: context.conversationId,
+        existing:
+          context.destination ??
+          mailboxDestination ??
+          storedConversation?.destination,
+      });
     if (resolved.kind === "mailbox") {
       const first = resolved.batch[0]!;
       const messages = resolved.batch.map((entry) => entry.message);
@@ -362,6 +370,12 @@ export function createConversationTurnWorker(
       visibility: storedConversation?.visibility,
     });
     const webActor = actor.platform === "web" ? actor : undefined;
+    // A person's Turn in a Thread does not start or message child agents:
+    // their results would report to the parent as the wrong Actor.
+    const disabledFeatures: AgentFeature[] = [
+      ...(webActor ? [] : ["interactive-auth" as const]),
+      ...(thread ? ["subagents" as const] : []),
+    ];
     const conversationLocation = storedConversation?.location;
     // TODO(dcramer): Remove the saved Message check after every deployed Turn
     // cursor stores Event Source.
@@ -574,7 +588,9 @@ export function createConversationTurnWorker(
               conversation.processing.pendingAuth?.actorId;
             const superseded = (
               await listActiveMailboxTurns(context.conversationId)
-            ).filter((record) => record.turnId !== turnId);
+            )
+              .map((turn) => turn.record)
+              .filter((record) => record.turnId !== turnId);
             for (const stale of superseded) {
               if (stopSignal?.aborted) {
                 return await completeCancelledTurn();
@@ -628,9 +644,18 @@ export function createConversationTurnWorker(
               instruction: {
                 text,
                 storedAttachments: attachments,
-                context: buildConversationContext(conversation, {
-                  excludeMessageIds: inputMessageIds,
-                }),
+                // A Thread's own Messages are in its history. Each Turn
+                // reads the root's Messages again.
+                ...(thread
+                  ? {
+                      context: thread.rootContext,
+                      includeConversationContextWithHistory: true,
+                    }
+                  : {
+                      context: buildConversationContext(conversation, {
+                        excludeMessageIds: inputMessageIds,
+                      }),
+                    }),
               },
               history: piMessages,
               actor,
@@ -654,7 +679,17 @@ export function createConversationTurnWorker(
                       conversationId: context.conversationId,
                     }),
                   }
-                : { disabledFeatures: ["interactive-auth"] as const }),
+                : undefined),
+              ...(disabledFeatures.length > 0
+                ? { disabledFeatures }
+                : undefined),
+              ...(thread?.locationConfiguration
+                ? {
+                    environment: {
+                      locationConfiguration: thread.locationConfiguration,
+                    },
+                  }
+                : undefined),
               state: {
                 pendingAuth: conversation.processing.pendingAuth,
                 sandboxRef,
@@ -797,7 +832,8 @@ export function createConversationTurnWorker(
             await acknowledge();
             return { status: "paused" };
           }
-          if (completedSuccessfully) {
+          // A Thread keeps memory off, like every child Conversation.
+          if (completedSuccessfully && !thread) {
             try {
               await scheduleSessionCompletedPluginTasks(
                 {
