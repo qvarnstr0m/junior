@@ -1,6 +1,7 @@
 import { Hono } from "hono";
 import { afterEach, describe, expect, it } from "vitest";
 import { createJuniorApi, type JuniorApiVariables } from "@/api";
+import { createAcpConversations } from "@/api/acp/conversations";
 import { stopConversationTurnResponseSchema } from "@/api/schema";
 import {
   appendAndEnqueueWebMessage,
@@ -8,8 +9,10 @@ import {
   webActorFromUser,
 } from "@/chat/conversations/web-input";
 import { legacyWebActorUserId } from "@/chat/conversations/legacy-web-actor-id";
+import { getConversationEventStore } from "@/chat/db";
 import {
   ackMessages,
+  completeConversationWork,
   startConversationWork,
 } from "@/chat/task-execution/store";
 import {
@@ -17,6 +20,10 @@ import {
   createConversationFixture,
   type ConversationFixture,
 } from "../../../fixtures/conversation";
+import {
+  expectChildAgentStopped,
+  startRunningChildAgent,
+} from "../../../fixtures/agent-invocations";
 import { testViewer } from "../../../fixtures/user";
 
 function stopRequest(
@@ -36,30 +43,46 @@ function stopRequest(
   );
 }
 
+/** Start a web Turn that already took its input and still holds its lease. */
+async function startParentTurn(
+  fixture: ConversationFixture,
+  idempotencyKey: string,
+) {
+  const { actor, conversationStore, queue, state } = fixture;
+  const created = await createAndEnqueueConversation(
+    { actor, idempotencyKey, message: "Start a long Turn." },
+    { conversationStore, queue, state },
+  );
+  const lease = await startConversationWork({
+    conversationId: created.conversationId,
+    conversationStore,
+    state,
+  });
+  if (lease.status !== "acquired") throw new Error("Expected work lease");
+  await ackMessages({
+    conversationId: created.conversationId,
+    conversationStore,
+    inboundMessageIds: [created.messageId],
+    leaseToken: lease.leaseToken,
+    state,
+  });
+  return { created, leaseToken: lease.leaseToken };
+}
+
 describe("conversation stop API", () => {
   afterEach(async () => {
     await closeConversationFixture();
   });
 
-  it("stops the active Turn and returns only the viewer's queued text", async () => {
+  it("stops the active Turn and its child agents and returns only the viewer's queued text", async () => {
     const fixture = await createConversationFixture();
     const { actor, conversationStore, queue, state } = fixture;
-    const created = await createAndEnqueueConversation(
-      { actor, idempotencyKey: "stop-root", message: "Start a long Turn." },
-      { conversationStore, queue, state },
-    );
-    // Hold the lease like a running Turn that already took its input.
-    const lease = await startConversationWork({
-      conversationId: created.conversationId,
+    const { created } = await startParentTurn(fixture, "stop-root");
+    const child = await startRunningChildAgent({
       conversationStore,
-      state,
-    });
-    if (lease.status !== "acquired") throw new Error("Expected work lease");
-    await ackMessages({
-      conversationId: created.conversationId,
-      conversationStore,
-      inboundMessageIds: [created.messageId],
-      leaseToken: lease.leaseToken,
+      idempotencyKey: "stop-child",
+      parentConversationId: created.conversationId,
+      queue,
       state,
     });
     const queued = await appendAndEnqueueWebMessage(
@@ -123,5 +146,66 @@ describe("conversation stop API", () => {
         },
       ],
     });
+    await expectChildAgentStopped(child, state);
+  });
+
+  it("stops child agents that still run after the parent Turn ended", async () => {
+    const fixture = await createConversationFixture();
+    const { actor, conversationStore, queue, state } = fixture;
+    const { created, leaseToken } = await startParentTurn(
+      fixture,
+      "stop-idle-root",
+    );
+    await completeConversationWork({
+      conversationId: created.conversationId,
+      conversationStore,
+      leaseToken,
+      state,
+    });
+    const child = await startRunningChildAgent({
+      conversationStore,
+      idempotencyKey: "stop-idle-child",
+      parentConversationId: created.conversationId,
+      queue,
+      state,
+    });
+
+    const response = await stopRequest(
+      fixture,
+      created.conversationId,
+      actor.email,
+    );
+    expect(response.status).toBe(200);
+    expect(
+      stopConversationTurnResponseSchema.parse(await response.json()),
+    ).toMatchObject({ status: "no_work" });
+    await expectChildAgentStopped(child, state);
+  });
+
+  it("stops child agents when an ACP client cancels the parent Turn", async () => {
+    const fixture = await createConversationFixture();
+    const { actor, conversationStore, queue, state } = fixture;
+    const { created } = await startParentTurn(fixture, "acp-stop-root");
+    const child = await startRunningChildAgent({
+      conversationStore,
+      idempotencyKey: "acp-stop-child",
+      parentConversationId: created.conversationId,
+      queue,
+      state,
+    });
+    const conversations = createAcpConversations({
+      conversationStore,
+      eventStore: getConversationEventStore(),
+      queue,
+      state,
+    });
+
+    await expect(
+      conversations.cancel({
+        conversationId: created.conversationId,
+        user: testViewer(actor.email),
+      }),
+    ).resolves.toBe("cancelled");
+    await expectChildAgentStopped(child, state);
   });
 });

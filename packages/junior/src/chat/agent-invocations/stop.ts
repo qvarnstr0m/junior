@@ -64,9 +64,9 @@ export async function stopConversationSession(args: {
 }
 
 /**
- * Stop the child agents of an agent Conversation that a stop interrupted.
- * The worker of that Conversation calls this after it records its own stop,
- * so this sends no stop request to that Conversation.
+ * Stop every child agent below a Conversation whose own stop is already
+ * recorded: a child agent's worker after its stop, or a person's stop of the
+ * parent Turn. This sends no stop request to that Conversation.
  */
 export async function stopChildAgentsOf(
   conversationId: string,

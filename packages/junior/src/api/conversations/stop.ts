@@ -1,4 +1,5 @@
 import type { User } from "@sentry/junior-plugin-api";
+import { stopChildAgentsOf } from "@/chat/agent-invocations/stop";
 import { getProductionSlackAdapter } from "@/chat/app/production";
 import { stopConversationTurn } from "@/chat/conversations/stop";
 import { webActorUserIds } from "@/chat/conversations/legacy-web-actor-id";
@@ -12,7 +13,8 @@ import type { StopConversationTurnResponse } from "../schema/conversation-stop";
 import { readConversationAccessFromSql } from "./access";
 
 /**
- * Stop the active Turn for one conversation participant.
+ * Stop the active Turn and every child agent below it for one conversation
+ * participant.
  *
  * The stop also removes the human messages queued before it. The viewer's own
  * web text comes back in the response so the dashboard can restore it to the
@@ -44,6 +46,8 @@ export async function stopConversationTurnForViewer(
       conversationStore,
       queue: services.queue,
     });
+    // A child agent can outlive the parent Turn, so stop it even with no Turn.
+    await stopChildAgentsOf(conversationId);
     if (result.status === "no_work") {
       return {
         conversationId,
