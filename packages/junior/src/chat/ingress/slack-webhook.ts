@@ -29,7 +29,7 @@ import {
 import { appendConversationMessages } from "@/chat/conversations/messages";
 import { stopConversationTurn } from "@/chat/conversations/stop";
 import {
-  stopChildAgentsOf,
+  stopChildAgentsOfRoot,
   stopConversationSession,
 } from "@/chat/agent-invocations/stop";
 import type { ConversationWorkQueue } from "@/chat/task-execution/queue";
@@ -435,7 +435,7 @@ async function handleSlackSessionStop(args: {
     state: args.state,
   });
   // A child agent can outlive the parent Turn, so stop it even with no Turn.
-  await stopChildAgentsOf(conversationId, args.state);
+  await stopChildAgentsOfRoot(conversationId, args.state);
   await createSlackWebApiStatusSender({
     channelId: args.channelId,
     threadTs: args.threadTs,

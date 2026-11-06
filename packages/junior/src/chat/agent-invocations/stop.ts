@@ -64,9 +64,9 @@ export async function stopConversationSession(args: {
 }
 
 /**
- * Stop every child agent below a Conversation whose own stop is already
- * recorded: a child agent's worker after its stop, or a person's stop of the
- * parent Turn. This sends no stop request to that Conversation.
+ * Stop the child agents of an agent Conversation that a stop interrupted.
+ * The worker of that Conversation calls this after it records its own stop,
+ * so this sends no stop request to that Conversation.
  */
 export async function stopChildAgentsOf(
   conversationId: string,
@@ -78,6 +78,22 @@ export async function stopChildAgentsOf(
     tree.conversationIds.filter((id) => id !== conversationId),
     state,
   );
+}
+
+/**
+ * Stop every child agent below a root Conversation after a person stops its
+ * Turn. A child agent Conversation is left alone: the tree stop would mark
+ * its own agent invocation `skipped`, so its parent would get no result. Its
+ * worker records the stop, reports it, and stops its own child agents.
+ */
+export async function stopChildAgentsOfRoot(
+  conversationId: string,
+  state?: StateAdapter,
+): Promise<void> {
+  if (await getLatestAgentInvocationForConversation(conversationId)) {
+    return;
+  }
+  await stopChildAgentsOf(conversationId, state);
 }
 
 async function finishStoppedTree(

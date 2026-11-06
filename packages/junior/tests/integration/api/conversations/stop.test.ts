@@ -2,6 +2,7 @@ import { Hono } from "hono";
 import { afterEach, describe, expect, it } from "vitest";
 import { createJuniorApi, type JuniorApiVariables } from "@/api";
 import { createAcpConversations } from "@/api/acp/conversations";
+import { getAgentInvocation } from "@/chat/agent-invocations/store";
 import { stopConversationTurnResponseSchema } from "@/api/schema";
 import {
   appendAndEnqueueWebMessage,
@@ -13,6 +14,7 @@ import { getConversationEventStore } from "@/chat/db";
 import {
   ackMessages,
   completeConversationWork,
+  hasConversationStop,
   startConversationWork,
 } from "@/chat/task-execution/store";
 import {
@@ -207,5 +209,41 @@ describe("conversation stop API", () => {
       }),
     ).resolves.toBe("cancelled");
     await expectChildAgentStopped(child, state);
+  });
+
+  it("leaves the stop report of a child agent Conversation to its worker", async () => {
+    const fixture = await createConversationFixture();
+    const { actor, conversationStore, queue, state } = fixture;
+    const { created } = await startParentTurn(fixture, "stop-child-root");
+    const child = await startRunningChildAgent({
+      conversationStore,
+      idempotencyKey: "stop-child-directly",
+      parentConversationId: created.conversationId,
+      queue,
+      state,
+    });
+    const { childConversationId, invocationId } = child.invocation;
+
+    const response = await stopRequest(
+      fixture,
+      childConversationId,
+      actor.email,
+    );
+    expect(response.status).toBe(200);
+    expect(
+      stopConversationTurnResponseSchema.parse(await response.json()),
+    ).toMatchObject({ status: "requested" });
+    // The agent invocation stays open, so the child's worker records the
+    // stop and reports it to the parent.
+    await expect(getAgentInvocation(invocationId)).resolves.toMatchObject({
+      status: "pending",
+    });
+    await expect(
+      hasConversationStop({
+        conversationId: childConversationId,
+        runId: child.runId,
+        state,
+      }),
+    ).resolves.toBe(true);
   });
 });

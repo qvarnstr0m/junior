@@ -1,5 +1,5 @@
 import type { User } from "@sentry/junior-plugin-api";
-import { stopChildAgentsOf } from "@/chat/agent-invocations/stop";
+import { stopChildAgentsOfRoot } from "@/chat/agent-invocations/stop";
 import { getProductionSlackAdapter } from "@/chat/app/production";
 import { stopConversationTurn } from "@/chat/conversations/stop";
 import { webActorUserIds } from "@/chat/conversations/legacy-web-actor-id";
@@ -47,7 +47,7 @@ export async function stopConversationTurnForViewer(
       queue: services.queue,
     });
     // A child agent can outlive the parent Turn, so stop it even with no Turn.
-    await stopChildAgentsOf(conversationId);
+    await stopChildAgentsOfRoot(conversationId);
     if (result.status === "no_work") {
       return {
         conversationId,
