@@ -91,7 +91,8 @@ export async function stopChildAgentsOf(
  * must run `stopConversationTurn` for the Conversation next.
  *
  * Known gap: the Conversation's run sees its stop only at its next stop
- * signal check. A child agent that it spawns before then is not stopped.
+ * signal check. A child agent that it spawns or gives new work to before
+ * then is not stopped.
  */
 export async function stopChildAgentsBelow(
   conversationId: string,
