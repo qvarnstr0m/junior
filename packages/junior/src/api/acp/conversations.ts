@@ -9,8 +9,7 @@ import {
   webActorFromUser,
 } from "@/chat/conversations/web-input";
 import { getAuthPausedConversationTurnId } from "@/chat/task-execution/mailbox-turn";
-import { stopConversationTurn } from "@/chat/conversations/stop";
-import { stopChildAgentsBelow } from "@/chat/agent-invocations/stop";
+import { stopConversation } from "@/chat/conversations/stop";
 import { clearSlackPendingReactions } from "@/chat/task-execution/slack-work";
 import { getProductionSlackAdapter } from "@/chat/app/production";
 import type { ConversationEventStore } from "@/chat/conversations/history";
@@ -141,11 +140,7 @@ export function createAcpConversations(
       if (!(await hasConversationAccess(conversationId, user))) {
         return "not_found";
       }
-      // Stop the child agents first, so a failure leaves the Turn running.
-      // A child agent can outlive the parent Turn, so this runs even with no
-      // Turn.
-      await stopChildAgentsBelow(conversationId, options.state);
-      const stopped = await stopConversationTurn({
+      const stopped = await stopConversation({
         conversationId,
         conversationStore: options.conversationStore,
         queue: options.queue,

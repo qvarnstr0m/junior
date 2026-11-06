@@ -1,0 +1,1 @@
+ALTER TABLE "junior_conversations" ADD COLUMN "watches_passive_at" timestamp with time zone;

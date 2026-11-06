@@ -5,7 +5,6 @@ import {
   markConversationsStopped,
 } from "@/chat/conversations/session-stop";
 import { getSqlExecutor } from "@/chat/db";
-import { cancelSubscriptions } from "@/chat/events/store";
 import {
   getConversationWorkState,
   stopConversationWork,
@@ -26,8 +25,8 @@ import type { TerminalAgentInvocation } from "./types";
 /**
  * Stop one child agent of a parent Conversation and every child agent below
  * it. The parent gets no result. SQL stops the work first. Then each
- * Conversation in the tree ends its session, and a Conversation stop request
- * aborts each run that is still working.
+ * Conversation in the tree ends its session, so its Watches become passive,
+ * and a Conversation stop request aborts each run that is still working.
  *
  * Returns undefined when the child does not belong to the parent.
  */
@@ -55,19 +54,6 @@ export async function stopChildAgent(args: {
 }
 
 /**
- * Stop a root Conversation's session the same way `stopAgent` stops a child:
- * its child agents stop, and it ends its own session. The caller interrupts
- * its own run.
- */
-export async function stopConversationSession(args: {
-  conversationId: string;
-  state?: StateAdapter;
-}): Promise<void> {
-  await stopChildAgentsOf(args.conversationId, args.state);
-  await endSessions([args.conversationId], args.state);
-}
-
-/**
  * Stop the child agents of an agent Conversation that a stop interrupted.
  * The worker of that Conversation calls this after it records its own stop,
  * so this sends no stop request to that Conversation.
@@ -87,8 +73,8 @@ export async function stopChildAgentsOf(
 /**
  * Stop every child agent below a Conversation that a person stops. The
  * Conversation's own agent invocations stay as they are: when it is a child
- * agent, its worker records the stop and reports it to its parent. Callers
- * must run `stopConversationTurn` for the Conversation next.
+ * agent, its worker records the stop and reports it to its parent. Call it
+ * through `stopConversation`, which stops the Conversation's Turn next.
  *
  * Known gap: the Conversation's run sees its stop only at its next stop
  * signal check. A child agent that it spawns or gives new work to before
@@ -158,24 +144,10 @@ async function finishStoppedTree(
   for (const invocation of tree.stopped) {
     await recordSubagentEnded(invocation);
   }
-  await endSessions(conversationIdsToStop, state);
+  await markConversationsStopped(conversationIdsToStop);
   for (const conversationId of conversationIdsToStop) {
     await stopConversationWork({ conversationId, state });
   }
-}
-
-/**
- * End each Conversation's watches, then record the stop, so the worker drops
- * every event those watches delivered.
- */
-async function endSessions(
-  conversationIds: string[],
-  state: StateAdapter | undefined,
-): Promise<void> {
-  for (const conversationId of conversationIds) {
-    await cancelSubscriptions({ conversationId, state });
-  }
-  await markConversationsStopped(conversationIds);
 }
 
 /**

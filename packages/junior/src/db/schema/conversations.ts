@@ -84,6 +84,12 @@ export const juniorConversations = pgTable(
     transcriptPurgedAt: timestamptz("transcript_purged_at"),
     /** Latest session stop. Automated input received before it is dropped. */
     stoppedAt: timestamptz("stopped_at"),
+    /**
+     * Set by a session stop and cleared by a person's next input. While set,
+     * Watches created before it are passive: their Events are saved as
+     * Messages and start no Turn.
+     */
+    watchesPassiveAt: timestamptz("watches_passive_at"),
     durationMs: integer("duration_ms").notNull().default(0),
     usage: jsonb("usage_json").$type<AgentTurnUsage>(),
     executionDurationMs: integer("execution_duration_ms").notNull().default(0),

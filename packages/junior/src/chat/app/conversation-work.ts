@@ -22,7 +22,7 @@ import {
   withAgentInvocationResultActors,
 } from "@/chat/agent-invocations/result";
 import { botConfig } from "@/chat/config";
-import { skipInputBeforeConversationStop } from "@/chat/conversations/session-stop";
+import { skipInputAfterConversationStop } from "@/chat/conversations/session-stop";
 import { createConversationTurnWorker } from "@/chat/task-execution/conversation-turn";
 import { resolveMailboxTurnWork } from "@/chat/task-execution/mailbox-turn";
 import {
@@ -177,8 +177,11 @@ export function createConversationWork(
   const run = async (
     context: ConversationWorkerContext,
   ): Promise<ConversationWorkerResult> => {
-    // Drop automated input that a session stop ended, on a root or a child.
-    const skipped = await skipInputBeforeConversationStop(context);
+    // Apply a session stop to automated input, on a root or a child.
+    const skipped = await skipInputAfterConversationStop(
+      context,
+      options.state,
+    );
     if (skipped) {
       return skipped;
     }

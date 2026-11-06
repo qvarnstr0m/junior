@@ -67,7 +67,7 @@ Junior reads every message in the thread, so you can course-correct at any point
 - **Narrow scope:** `@jr skip the frontend, just fix the query`
 - **Verbosity:** `@jr tl;dr` or `@jr more detail on the error handling`
 
-When Junior acknowledges a stop, it leaves the thread and cancels active resource watches for that conversation. A later `@jr` mention invites Junior back, but you must ask it to create those watches again.
+When Junior acknowledges a stop, it leaves the thread and stops its child agents. Its resource watches, and those of its child agents, become passive: Junior saves their events to the conversation but does not act on them. A later `@jr` mention invites Junior back and makes those watches active again.
 
 Junior cannot undo side effects that have already landed — a pushed commit, a filed issue, a sent Slack message. Redirect before the action, not after.
 

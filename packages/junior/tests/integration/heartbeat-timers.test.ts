@@ -1,6 +1,6 @@
 import { afterEach, expect, it, vi } from "vitest";
 import { runHeartbeat } from "@/chat/agent-dispatch/heartbeat";
-import { stopConversationSession } from "@/chat/agent-invocations/stop";
+import { stopConversation } from "@/chat/conversations/stop";
 import { getEventCatalog } from "@/chat/events/runtime-catalog";
 import { takeDueTimerWatches } from "@/chat/events/store";
 import { runTimerWatchHeartbeat } from "@/chat/events/timers";
@@ -13,6 +13,7 @@ import { getConversationWorkState } from "@/chat/task-execution/store";
 import {
   closeConversationFixture,
   createConversationWebHarness,
+  passiveWatchMessageTexts,
 } from "../fixtures/conversation";
 import { context, execute } from "../fixtures/event-automations";
 
@@ -166,16 +167,21 @@ it("recovers an abandoned claim and a failed queue send without duplicating inpu
   ).toHaveLength(1);
 });
 
-it("drops a fired timer when the root session stops, the same as a child", async () => {
+it("saves timers of a stopped root to its transcript until a person writes", async () => {
   const clock = vi.spyOn(Date, "now").mockReturnValue(1_800_000_000_000);
-  const { conversationId, tools, queue, drain, agentRuns } =
-    await timerConversation();
+  const fixture = await timerConversation();
+  const { conversationId, tools, queue, drain, agentRuns } = fixture;
   const input = { after_ms: 60_000, intent: "Check the deployment." };
   await execute(tools.watchTimer!, input, "timer-1");
   await execute(
     tools.watchTimer!,
     { after_ms: 600_000, intent: "Check much later." },
     "timer-2",
+  );
+  await execute(
+    tools.watchTimer!,
+    { after_ms: 3_600_000, intent: "Check after the reply." },
+    "timer-3",
   );
   clock.mockReturnValue(clock() + 60_000);
   await runTimerWatchHeartbeat({ nowMs: clock(), queue });
@@ -184,19 +190,42 @@ it("drops a fired timer when the root session stops, the same as a child", async
       .pendingMessages,
   ).toHaveLength(1);
 
-  // The Slack `stop` keyword runs this session stop on a root.
-  await stopConversationSession({ conversationId });
-  expect(await execute(tools.listWatches!, {})).toEqual({ subscriptions: [] });
+  // A person's stop makes the watches passive: an event that already
+  // arrived and a later one are saved to the transcript and start no Turn.
+  await stopConversation({ conversationId, queue });
+  expect(
+    ((await execute(tools.listWatches!, {})) as { subscriptions: unknown[] })
+      .subscriptions,
+  ).toHaveLength(2);
   clock.mockReturnValue(clock() + 600_000);
   await runTimerWatchHeartbeat({ nowMs: clock(), queue });
+  clock.mockReturnValue(clock() + 120_000);
   await drain();
   expect(agentRuns).toHaveLength(0);
+  const passive = (await passiveWatchMessageTexts(conversationId)).join("\n");
+  expect(passive).toContain("Check the deployment.");
+  expect(passive).toContain("Check much later.");
 
   // A watch set after the stop wakes the root again.
-  await execute(tools.watchTimer!, input, "timer-3");
+  await execute(tools.watchTimer!, input, "timer-4");
   clock.mockReturnValue(clock() + 60_000);
   await runTimerWatchHeartbeat({ nowMs: clock(), queue });
   clock.mockReturnValue(clock() + 120_000);
   await drain();
   expect(agentRuns).toHaveLength(1);
+
+  // A person's message makes the old watches active again.
+  await fixture.continue({
+    conversationId,
+    idempotencyKey: "after-stop",
+    message: "Keep watching.",
+  });
+  await drain();
+  expect(agentRuns).toHaveLength(2);
+  clock.mockReturnValue(clock() + 3_600_000);
+  await runTimerWatchHeartbeat({ nowMs: clock(), queue });
+  clock.mockReturnValue(clock() + 120_000);
+  await drain();
+  expect(agentRuns).toHaveLength(3);
+  expect(agentRuns[2]!.source).toMatchObject({ kind: "event" });
 });

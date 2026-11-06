@@ -248,7 +248,7 @@ async function prepareLocalChatRun(
   const { bindMessageAgent } = await import("@/chat/agent-invocations/message");
   const { createChildConversationWorker } =
     await import("@/chat/agent-invocations/result");
-  const { skipInputBeforeConversationStop } =
+  const { skipInputAfterConversationStop } =
     await import("@/chat/conversations/session-stop");
   const { createLocalConversationWork } =
     await import("@/chat/local/conversation-work");
@@ -266,7 +266,7 @@ async function prepareLocalChatRun(
       queue: localConversationWork.queue,
       // The local queue carries only child Conversation work.
       run: async (context) =>
-        (await skipInputBeforeConversationStop(context)) ??
+        (await skipInputAfterConversationStop(context)) ??
         (await childWorker(context)),
     });
   });

@@ -18,6 +18,7 @@ import {
   webActorFromUser,
 } from "@/chat/conversations/web-input";
 import { legacyWebActorUserId } from "@/chat/conversations/legacy-web-actor-id";
+import { getConversationStoppedAtMs } from "@/chat/conversations/session-stop";
 import { getConversationEventStore } from "@/chat/db";
 import { isEventMailboxMetadata } from "@/chat/events/notification";
 import {
@@ -231,6 +232,9 @@ describe("conversation stop API", () => {
       stopConversationTurnResponseSchema.parse(await response.json()),
     ).toMatchObject({ status: "no_work" });
     await expectChildAgentStopped(child, state);
+    await expect(
+      getConversationStoppedAtMs(created.conversationId),
+    ).resolves.toBeDefined();
     // A stop keeps a result that the parent already read. The child's
     // session still ends, so no watch or queued input starts it again.
     await expect(getAgentInvocation(done.invocationId)).resolves.toMatchObject({
@@ -272,6 +276,9 @@ describe("conversation stop API", () => {
       }),
     ).resolves.toBe("cancelled");
     await expectChildAgentStopped(child, state);
+    await expect(
+      getConversationStoppedAtMs(created.conversationId),
+    ).resolves.toBeDefined();
   });
 
   it("reports a person's stop of a child agent to its parent and stops the agents below it", async () => {
@@ -328,6 +335,17 @@ describe("conversation stop API", () => {
       parentMailboxStatus: "skipped",
       status: "stopped",
     });
+    // The stop ends the sessions of the child and the agents below it, but
+    // not of its parent.
+    await expect(
+      getConversationStoppedAtMs(child.childConversationId),
+    ).resolves.toBeDefined();
+    await expect(
+      getConversationStoppedAtMs(helper.childConversationId),
+    ).resolves.toBeDefined();
+    await expect(
+      getConversationStoppedAtMs(created.conversationId),
+    ).resolves.toBeUndefined();
   });
 
   it("starts no parent Turn for a child result that waits when a person stops the parent", async () => {

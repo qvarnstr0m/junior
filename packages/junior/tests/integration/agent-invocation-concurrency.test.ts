@@ -25,6 +25,7 @@ import { disconnectStateAdapter } from "@/chat/state/adapter";
 import { processConversationQueueMessage } from "@/chat/task-execution/vercel-callback";
 import { createSearchAgentsTool } from "@/chat/tools/runtime/search-agents";
 import { createStopAgentTool } from "@/chat/tools/runtime/stop-agent";
+import { passiveWatchMessageTexts } from "../fixtures/conversation";
 import { deferred } from "../fixtures/conversation-work";
 import { createConfiguredJuniorSqlFixture } from "../fixtures/sql";
 import { createModelAgentRunnerForRun } from "../fixtures/agent-runner";
@@ -560,9 +561,9 @@ describe("agent invocation identity and concurrency", () => {
         agents: [{ status: "idle", task: "Watch the deploy." }],
       });
 
-      // A stop of the idle child ends its watches and records the stop, so
-      // a timer event that already reached it is dropped, and a later timer
-      // never fires.
+      // A stop of the idle child makes its watches passive, so a timer event
+      // that already reached it and a later timer are saved to its
+      // transcript and start no Turn.
       await execute(
         childTools.watchTimer!,
         { after_ms: 60_000, intent: "Check once more." },
@@ -580,12 +581,20 @@ describe("agent invocation identity and concurrency", () => {
         stopAgent.execute!({ conversation_id: child.childConversationId }, {}),
       ).resolves.toMatchObject({ stopped: true });
       await expect(execute(childTools.listWatches!, {})).resolves.toEqual({
-        subscriptions: [],
+        subscriptions: [
+          expect.objectContaining({ intent: "Check much later." }),
+        ],
       });
       clock.mockReturnValue(clock() + 600_000);
       await runTimerWatchHeartbeat({ nowMs: clock(), queue: harness.queue });
+      clock.mockReturnValue(clock() + 120_000);
       await harness.drainQueuedWork();
       expect(harness.requests()).toHaveLength(2);
+      const passive = (
+        await passiveWatchMessageTexts(child.childConversationId)
+      ).join("\n");
+      expect(passive).toContain("Check once more.");
+      expect(passive).toContain("Check much later.");
       await expect(searchAgents()).resolves.toMatchObject({
         agents: [{ status: "stopped" }],
       });

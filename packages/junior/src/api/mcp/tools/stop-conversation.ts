@@ -11,8 +11,8 @@ import {
 } from "../tool-context";
 
 /**
- * Register `stopConversation`, which stops the active Turn and every child
- * agent below the Conversation.
+ * Register `stopConversation`, which stops the Conversation and every child
+ * agent below it, and makes their Watches passive.
  */
 export function registerStopConversationTool(
   server: McpServer,
@@ -23,7 +23,7 @@ export function registerStopConversationTool(
     {
       title: "Stop conversation",
       description:
-        "Stop the running turn of one of your conversations and every child agent below it. Messages that wait for the turn are dropped. It starts no new work.",
+        "Stop one of your conversations: its running turn and every child agent below it. Their watches become passive: events are saved to the conversation but start no turn, until you send the conversation a message. Messages that wait for the turn are dropped. It starts no new work.",
       inputSchema: { conversationId: mcpConversationIdSchema },
       outputSchema: {
         status: z

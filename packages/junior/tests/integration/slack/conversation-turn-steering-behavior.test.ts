@@ -3,6 +3,7 @@
 // packages/junior-evals/evals/integration/conversation/steering.eval.ts
 import { ThreadImpl } from "chat";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { getConversationStoppedAtMs } from "@/chat/conversations/session-stop";
 import {
   SLACK_BOT_USER_ID,
   createConversationWorkQueueTestAdapter,
@@ -171,6 +172,9 @@ describe("Slack ingress: thread messages", () => {
       }),
     ]);
     await expectChildAgentStopped(child, state);
+    await expect(
+      getConversationStoppedAtMs(CONVERSATION_ID),
+    ).resolves.toBeDefined();
     // Unlike the `stop` keyword, the native button does not opt out.
     await expect(state.isSubscribed(CONVERSATION_ID)).resolves.toBe(true);
   });
